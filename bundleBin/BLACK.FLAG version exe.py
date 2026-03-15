@@ -113,12 +113,13 @@ APP_VERSION = "1.1"
 # URL du fichier source sur GitHub pour vérification de version
 _UPDATE_URL = (
     "https://raw.githubusercontent.com/theolddispatch/"
-    "BLACK-FLAG-version-exe/refs/heads/main/"
-    "src/BLACK.FLAG%20version%20exe.py"
+    "BLACK-FLAG-version-exe/refs/heads/main/src/"
+    "BLACK.FLAG%20version%20exe.py"
 )
 _UPDATE_PAGE = (
     "https://github.com/theolddispatch/BLACK-FLAG-version-exe/blob/main/"
-    "src/BLACK.FLAG%20version%20exe.py"
+    "Script%20%C3%A0%20%C3%A9x%C3%A9cuter%20si%20vous%20avez%20Python%20"
+    "(beaucoup%20l'ont%20par%20d%C3%A9faut)/BLACK.FLAG%20version%20exe.py"
 )
 
 def _check_update_available() -> bool:
