@@ -30,7 +30,7 @@ BLACK FLAG est une application de bureau qui automatise l'upload de torrents de 
 - Toggle exclusif entre les deux clients dans les paramètres
 
 ### Surveillance et notifications
-- **Voyant de santé** La Cale en temps réel (vérification toutes les minutes)
+- **Voyant de santé** La Cale en temps réel (vérification toutes les minutes depuis un watcher exterieur pour ne pas saturer l'infrastructure)
 - **Health check en deux passes** avant chaque upload :
   - Passe 1 : vérification via source externe (isitdownrightnow.com)
   - Passe 2 : connexion directe HEAD au site
