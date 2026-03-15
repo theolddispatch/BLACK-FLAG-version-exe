@@ -110,6 +110,43 @@ PLAYLIST = [
 
 APP_VERSION = "1.1"
 
+# URL du fichier source sur GitHub pour vérification de version
+_UPDATE_URL = (
+    "https://raw.githubusercontent.com/theolddispatch/"
+    "BLACK-FLAG-version-exe/main/Script%20%C3%A0%20"
+    "%C3%A9x%C3%A9cuter%20si%20vous%20avez%20Python%20"
+    "(beaucoup%20l'ont%20par%20d%C3%A9faut)/BLACK.FLAG%20version%20exe.py"
+)
+_UPDATE_PAGE = (
+    "https://github.com/theolddispatch/BLACK-FLAG-version-exe/blob/main/"
+    "Script%20%C3%A0%20%C3%A9x%C3%A9cuter%20si%20vous%20avez%20Python%20"
+    "(beaucoup%20l'ont%20par%20d%C3%A9faut)/BLACK.FLAG%20version%20exe.py"
+)
+
+def _check_update_available() -> bool:
+    """
+    Télécharge le fichier source GitHub et compare la version.
+    Retourne True si une version plus récente est disponible.
+    """
+    if not _REQUESTS_OK:
+        return False
+    try:
+        r = requests.get(_UPDATE_URL, timeout=10,
+                         headers={"User-Agent": "BLACK-FLAG-updater/1.1"})
+        if r.status_code != 200:
+            return False
+        for line in r.text.splitlines()[:20]:
+            if "APP_VERSION" in line and "=" in line:
+                remote = line.split("=")[1].strip().strip("\"'")
+                # Comparaison sémantique simple : tuple de floats
+                def _v(s):
+                    try: return tuple(int(x) for x in s.split("."))
+                    except: return (0,)
+                return _v(remote) > _v(APP_VERSION)
+    except Exception:
+        pass
+    return False
+
 # ── Code de bypass santé (obfusqué, ne pas modifier) ─────────────────────────
 _BF_OBF = b"GAwwByAoHRYPDg1oOw=="
 _BF_KEY = b"BLACKFLAG_KEY_X"
@@ -251,6 +288,7 @@ DEFAULTS = {
     "notify_interval": "10",   # minutes : "10", "20", "60"
     "save_logs":       True,
     "save_curl":       True,
+    "check_updates":   True,
 }
 
 def load_cfg():
@@ -1472,6 +1510,10 @@ T = {
         lbl_delay="Délai uploads (s) :",
         lbl_notify="Notification si HTTP 200 :",
         lbl_save_logs="Sauvegarde des logs :",
+        lbl_check_updates="Vérif. mises à jour :",
+        check_updates_on="ACTIF",
+        check_updates_off="NON ACTIF",
+        lbl_update_available="Mise à jour disponible",
         lbl_save_curl="Génération fichiers curl Web :",
         save_logs_on="ACTIF",
         save_logs_off="NON ACTIF",
@@ -1565,6 +1607,10 @@ T = {
         lbl_delay="Upload delay (s) :",
         lbl_notify="Notify on HTTP 200 :",
         lbl_save_logs="Log backup :",
+        lbl_check_updates="Check for updates :",
+        check_updates_on="ACTIVE",
+        check_updates_off="INACTIVE",
+        lbl_update_available="Update available",
         lbl_save_curl="Web curl file generation :",
         save_logs_on="ACTIVE",
         save_logs_off="INACTIVE",
@@ -1658,6 +1704,10 @@ T = {
         lbl_delay="Retraso uploads (s) :",
         lbl_notify="Notif. si HTTP 200 :",
         lbl_save_logs="Guardar logs :",
+        lbl_check_updates="Buscar actualizaciones :",
+        check_updates_on="ACTIVO",
+        check_updates_off="INACTIVO",
+        lbl_update_available="Actualización disponible",
         lbl_save_curl="Generar archivos curl Web :",
         save_logs_on="ACTIVO",
         save_logs_off="INACTIVO",
@@ -2017,6 +2067,7 @@ class App:
         self._watcher: SiteWatcher | None = None
         self._save_logs_enabled = bool(self.cfg.get("save_logs", False))
         self._save_curl_enabled = bool(self.cfg.get("save_curl", False))
+        self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
 
         # Fix combos invisibles sur Windows : forcer foreground sur les combobox
         # Le thème "clam" ne répercute pas correctement foreground en mode readonly
@@ -2096,6 +2147,15 @@ class App:
         self._lbl_log_header = tk.Label(
             hdr, text="", font=FB, bg=C["bg"], fg=C["gold"], anchor="w")
         self._lbl_log_header.pack(side="left")
+
+        # Étiquette "Mise à jour disponible" — cachée par défaut
+        self._lbl_update = tk.Label(
+            hdr, text="", font=FM8,
+            bg=C["bg"], fg=C["green"],
+            cursor="hand2")
+        self._lbl_update.pack(side="left", padx=(10, 0))
+        self._lbl_update.bind("<Button-1>", lambda e: __import__("webbrowser").open(_UPDATE_PAGE))
+        self._lbl_update.pack_forget()   # invisible jusqu'à détection MAJ
 
         # ── Boutons header — tous justifiés à droite ──────────────────────
         # Ordre d'ajout inversé pour pack(side="right") :
@@ -2824,6 +2884,21 @@ class App:
         # Appliquer l'état visuel initial
         p.after(20, self._refresh_notify_ui)
 
+        # ── Vérification des mises à jour ─────────────────────────────────
+        lbl_cu = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
+                          anchor="w", width=24)
+        lbl_cu.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=(6, 2))
+        self._s_labels["row_lbl_check_updates"] = (lbl_cu, "lbl_check_updates")
+
+        self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
+        self._btn_check_updates = tk.Button(
+            p, text="", font=FB,
+            bg=C["panel"], relief="flat", bd=0, padx=8, pady=3,
+            cursor="hand2", command=self._toggle_check_updates)
+        self._btn_check_updates.grid(row=r, column=1, sticky="w", padx=4, pady=(6, 2))
+        p.after(30, self._refresh_check_updates_ui)
+        r += 1
+
     # ── Barre du bas ──────────────────────────────────────────────────────────
     def _build_bottom(self):
         f = tk.Frame(self.root, bg=C["bg"])
@@ -2979,6 +3054,10 @@ class App:
         # Toggle notification
         self._refresh_notify_ui()
         self._refresh_logs_curl_ui()
+        self._refresh_check_updates_ui()
+        # Étiquette MAJ
+        if hasattr(self, "_lbl_update") and self._lbl_update.winfo_ismapped():
+            self._lbl_update.config(text=f"  ↑ {t('lbl_update_available')}")
         if not self.running:
             self.status.set(t("status_ready"))
 
@@ -3169,6 +3248,7 @@ class App:
         self._save_logs_enabled = bool(self.cfg.get("save_logs", False))
         self._save_curl_enabled = bool(self.cfg.get("save_curl", False))
         self.root.after(35, self._refresh_logs_curl_ui)
+        self.root.after(40, self._refresh_check_updates_ui)
         # Langue UI
         self.vars["ui_lang"].set(self.cfg.get("ui_lang", "fr"))
         self._loading = False
@@ -3177,6 +3257,10 @@ class App:
         self._autosave_job = None
         for v in self.vars.values():
             v.trace_add("write", self._on_field_change)
+
+        # Vérification MAJ au démarrage (en arrière-plan)
+        self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
+        self.root.after(2000, self._run_update_check)   # 2s après démarrage
 
     # ══════════════════════════════════════════════════════════════════════════
     # WATCHER — Notification retour site
@@ -3208,6 +3292,40 @@ class App:
             w.grid() if is_qb else w.grid_remove()
         for w in self._tr_rows:
             w.grid_remove() if is_qb else w.grid()
+
+    def _toggle_check_updates(self):
+        self._check_updates_enabled = not self._check_updates_enabled
+        cfg = self._collect(); cfg["check_updates"] = self._check_updates_enabled
+        save_cfg(cfg); self.cfg = cfg
+        self._refresh_check_updates_ui()
+
+    def _refresh_check_updates_ui(self):
+        if not hasattr(self, "_btn_check_updates"):
+            return
+        if self._check_updates_enabled:
+            self._btn_check_updates.config(
+                text=t("check_updates_on"), fg=C["green"],
+                highlightthickness=1, highlightbackground=C["green"])
+        else:
+            self._btn_check_updates.config(
+                text=t("check_updates_off"), fg=C["muted"],
+                highlightthickness=1, highlightbackground=C["muted"])
+
+    def _run_update_check(self):
+        """Vérifie la MAJ en arrière-plan au démarrage."""
+        if not self._check_updates_enabled:
+            return
+        def _check():
+            available = _check_update_available()
+            if available:
+                self.root.after(0, self._show_update_badge)
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _show_update_badge(self):
+        """Affiche l'étiquette verte 'Mise à jour disponible' dans le header."""
+        if hasattr(self, "_lbl_update"):
+            self._lbl_update.config(text=f"  ↑ {t('lbl_update_available')}")
+            self._lbl_update.pack(side="left", padx=(10, 0))
 
     def _toggle_save_logs(self):
         self._save_logs_enabled = not self._save_logs_enabled
