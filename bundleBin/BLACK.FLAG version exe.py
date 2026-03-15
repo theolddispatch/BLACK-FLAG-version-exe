@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BLACK FLAG v1.1 — Upload automatique vers La Cale
+BLACK FLAG v1.2 — Upload automatique vers La Cale
 Développé par Theolddispatch & The40n8  ·  version exécutable
 
 Logique séries :
@@ -108,7 +108,8 @@ PLAYLIST = [
      "https://opengameart.org/sites/default/files/pirate.mp3"),
 ]
 
-APP_VERSION = "1.1"
+APP_VERSION   = "1.2"
+APP_NEW_UPDATES = "v1.2 — MAJ Web, vérification seed avant upload"
 
 # URL du fichier source sur GitHub pour vérification de version
 _UPDATE_URL = (
@@ -122,30 +123,39 @@ _UPDATE_PAGE = (
     "(beaucoup%20l'ont%20par%20d%C3%A9faut)/BLACK.FLAG%20version%20exe.py"
 )
 
-def _check_update_available() -> bool:
+def _check_update_available():
     """
     Télécharge le fichier source GitHub et compare la version.
-    Retourne True si une version plus récente est disponible.
+    Retourne (True, changelog) si une version plus récente est disponible,
+    (False, "") sinon.
     """
     if not _REQUESTS_OK:
-        return False
+        return False, ""
     try:
         r = requests.get(_UPDATE_URL, timeout=10,
                          headers={"User-Agent": "BLACK-FLAG-updater/1.1"})
         if r.status_code != 200:
-            return False
-        # Scan les 150 premières lignes (APP_VERSION est ligne ~111)
-        for line in r.text.splitlines()[:150]:
+            return False, ""
+        remote_version  = ""
+        remote_changelog = ""
+        for line in r.text.splitlines()[:160]:
             stripped = line.strip()
             if stripped.startswith("APP_VERSION") and "=" in stripped:
-                remote = stripped.split("=")[1].strip().strip("\"'")
-                def _v(s):
-                    try: return tuple(int(x) for x in s.strip().split("."))
-                    except: return (0,)
-                return _v(remote) > _v(APP_VERSION)
+                remote_version = stripped.split("=")[1].strip().strip("\"'")
+            if stripped.startswith("APP_NEW_UPDATES") and "=" in stripped:
+                remote_changelog = stripped.split("=", 1)[1].strip().strip("\"'")
+            if remote_version and remote_changelog:
+                break
+        if not remote_version:
+            return False, ""
+        def _v(s):
+            try: return tuple(int(x) for x in s.strip().split("."))
+            except: return (0,)
+        if _v(remote_version) > _v(APP_VERSION):
+            return True, remote_changelog
     except Exception:
         pass
-    return False
+    return False, ""
 
 # ── Code de bypass santé (obfusqué, ne pas modifier) ─────────────────────────
 _BF_OBF = b"GAwwByAoHRYPDg1oOw=="
@@ -989,6 +999,14 @@ class QBit:
             return r.status_code == 200 and "ok" in r.text.lower()
         except Exception: return False
 
+    def is_checking(self):
+        """Retourne True si au moins un torrent est en cours de vérification (checking)."""
+        try:
+            r = self.sess.get(f"{self.url}/api/v2/torrents/info",
+                              params={"filter": "checking"}, timeout=10)
+            return bool(r.json())
+        except Exception: return False
+
 
 class Transmission:
     def __init__(self, url, user, pwd, log):
@@ -1034,6 +1052,20 @@ class Transmission:
             return result == "success"
         except Exception:
             return False
+
+    def is_checking(self):
+        """Retourne True si au moins un torrent est en cours de vérification."""
+        try:
+            payload = {"method": "torrent-get",
+                       "arguments": {"fields": ["status"]}}
+            r = requests.post(f"{self.url}/transmission/rpc",
+                              json=payload,
+                              headers={"X-Transmission-Session-Id": self._sid},
+                              auth=self._auth, timeout=10)
+            torrents = r.json().get("arguments", {}).get("torrents", [])
+            # Status 2 = checking dans Transmission
+            return any(t.get("status") == 2 for t in torrents)
+        except Exception: return False
 
 
 
@@ -1081,6 +1113,24 @@ class Worker:
         self._stop = threading.Event()
 
     def stop(self): self._stop.set()
+
+    def _wait_if_checking(self, qb, log):
+        """
+        Attend si le client torrent est en train de vérifier un torrent.
+        Annonce 30s d'attente, réessaie jusqu'à ce que ce soit libre.
+        """
+        if not qb.ok:
+            return
+        while not self._stop.is_set():
+            if not qb.is_checking():
+                break
+            log("  Client torrent en cours de montage — attente 30s...", "muted")
+            for _ in range(30):
+                if self._stop.is_set():
+                    return
+                time.sleep(1)
+        if not self._stop.is_set():
+            log("  Client torrent disponible — reprise.", "muted")
 
     def run(self):
         try:
@@ -1248,6 +1298,7 @@ class Worker:
                                        p["vc"], p["ac"], p["lang"], sz, rating,
                                        genres, cast, p["hdr"], is_series=False)
 
+                    self._wait_if_checking(qb, self.log)
                     self.log("  Upload...", "muted")
                     terms    = lc.build_terms(p, is_series=False)
                     if conn_mode == "api":
@@ -1402,6 +1453,7 @@ class Worker:
                                        sz, rating, genres, cast, p.get("hdr", ""),
                                        is_series=True, season_num=season_num)
 
+                    self._wait_if_checking(qb, self.log)
                     self.log("  Upload...", "muted")
                     terms    = lc.build_terms(p, is_series=True)
                     if conn_mode == "api":
@@ -3319,6 +3371,7 @@ class App:
         cfg["torrent_client"] = client
         save_cfg(cfg); self.cfg = cfg
         self._update_client_ui()
+        self._log_active_config()
 
     def _update_client_ui(self):
         """Met à jour les boutons et affiche les champs du client actif."""
@@ -3363,16 +3416,46 @@ class App:
         if not self._check_updates_enabled:
             return
         def _check():
-            available = _check_update_available()
+            available, changelog = _check_update_available()
             if available:
-                self.root.after(0, self._show_update_badge)
+                self.root.after(0, self._show_update_badge, changelog)
         threading.Thread(target=_check, daemon=True).start()
 
-    def _show_update_badge(self):
-        """Affiche l'étiquette verte 'Mise à jour disponible' dans le header."""
-        if hasattr(self, "_lbl_update"):
-            self._lbl_update.config(text=f"  ↑ {t('lbl_update_available')}")
-            self._lbl_update.pack(side="left", padx=(10, 0))
+    def _show_update_badge(self, changelog=""):
+        """Affiche l'étiquette verte 'Mise à jour disponible' avec tooltip."""
+        if not hasattr(self, "_lbl_update"):
+            return
+        self._lbl_update.config(text=f"  ↑ {t('lbl_update_available')}")
+        self._lbl_update.pack(side="left", padx=(10, 0))
+        # Tooltip au survol
+        if changelog:
+            self._add_tooltip(self._lbl_update, changelog)
+
+    def _add_tooltip(self, widget, text):
+        """Affiche un petit popup au survol du widget."""
+        tip = {"win": None}
+
+        def _show(e):
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            w = tk.Toplevel(self.root)
+            w.wm_overrideredirect(True)
+            w.wm_geometry(f"+{x}+{y}")
+            w.configure(bg=C["border"])
+            tk.Label(w, text=text, font=FM8,
+                     bg=C["panel"], fg=C["gold"],
+                     relief="flat", bd=0, padx=8, pady=4,
+                     wraplength=500, justify="left"
+                     ).pack()
+            tip["win"] = w
+
+        def _hide(e):
+            if tip["win"]:
+                tip["win"].destroy()
+                tip["win"] = None
+
+        widget.bind("<Enter>", _show)
+        widget.bind("<Leave>", _hide)
 
     def _toggle_save_logs(self):
         self._save_logs_enabled = not self._save_logs_enabled
@@ -3618,12 +3701,16 @@ class App:
         """Bascule entre mode API et mode Web."""
         self._conn_mode = "api" if self._conn_mode == "web" else "web"
         self._update_conn_btn()
-        # Sauvegarder immédiatement
         cfg = self._collect()
         cfg["conn_mode"] = self._conn_mode
         save_cfg(cfg); self.cfg = cfg
-        mode_name = t("conn_api") if self._conn_mode == "api" else t("conn_web")
-        self._log(f"Mode de connexion : {mode_name}", "ok")
+        self._log_active_config()
+
+    def _log_active_config(self):
+        """Affiche la configuration active dans le log."""
+        conn  = "API" if self._conn_mode == "api" else "Web"
+        client = "TRANSMISSION" if getattr(self, "_torrent_client", "qbittorrent") == "transmission" else "QBITTORRENT"
+        self._log(f"  Configuration active : La Cale/{conn}/{client}", "ok")
 
     def _toggle_autosave(self):
         """Active ou désactive la sauvegarde automatique."""
