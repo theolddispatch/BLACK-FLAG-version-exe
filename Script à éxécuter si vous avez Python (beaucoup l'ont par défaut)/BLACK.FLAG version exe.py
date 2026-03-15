@@ -318,6 +318,12 @@ def parse_filename(filename):
         raw = re.split(r'(?i)[._](?:1080p|720p|2160p|4k|bluray|web.?dl|webrip|hdtv|x264|x265|hevc)', stem)[0]
     title = re.sub(r'[._\-]', ' ', raw).strip()
 
+    # Nettoyer les parasites scène : [Torrent911.vc], (Torrent911), préfixes sites
+    title = re.sub(r'^\s*\[.*?\]\s*', '', title)          # supprimer [xxx] en début
+    title = re.sub(r'^\s*\(.*?\)\s*', '', title)          # supprimer (xxx) en début
+    title = re.sub(r'\(?\s*$', '', title).strip()          # supprimer parenthèse orpheline en fin
+    title = title.strip()
+
     res = ""
     if   re.search(r'2160P|4K|UHD', su): res = "2160p"
     elif re.search(r'1080P', su):         res = "1080p"
@@ -428,7 +434,14 @@ def parse_season_dir(season_dir: Path):
     Retourne : { series_name, season_num, files, tags_from_episodes }
     """
     series_dir  = season_dir.parent
-    series_name = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', series_dir.name).strip()
+    # Si season_dir est directement le dossier de la série (pas de sous-dossier saison)
+    # alors series_dir pointe vers la racine — on utilise season_dir.name comme nom
+    # Détection : le dossier parent ne contient pas de dossiers de saison typiques
+    if not re.search(r'(?:saison|season|s\d)', season_dir.name, re.I):
+        # season_dir EST le dossier de la série
+        series_name = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', season_dir.name).strip()
+    else:
+        series_name = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', series_dir.name).strip()
 
     # Numéro de saison depuis le nom du dossier
     season_num = 1
@@ -807,26 +820,34 @@ class LaCale:
         return terms
 
     def login_api(self, passkey):
-        """Mode API externe — pas de login, juste vérifier que le passkey fonctionne."""
+        """Mode API externe — vérifie le passkey via /api/user puis /api/external."""
         self.log("Connexion La Cale (mode API)...", "gold")
+        passkey = passkey.strip()
         self._passkey = passkey
-        try:
-            r = self.sess.get(f"{self.url}/api/external/meta",
-                              params={"passkey": passkey}, timeout=10)
-            if r.status_code == 200:
-                self.log("  API OK — passkey valide.", "ok")
-                return True
-            self.log(f"  Erreur API (HTTP {r.status_code}) — vérifiez le passkey.", "err")
+        if not passkey:
+            self.log("  Erreur : passkey vide — renseignez-le dans les paramètres.", "err")
             return False
-        except Exception as e:
-            self.log(f"  Erreur réseau : {e}", "err")
-            return False
+        # Endpoints à tester dans l'ordre
+        for endpoint in [
+            f"{self.url}/api/user",
+            f"{self.url}/api/external",
+            f"{self.url}/api/external/meta",
+        ]:
+            try:
+                r = self.sess.get(endpoint, params={"apikey": passkey}, timeout=10)
+                if r.status_code == 200:
+                    self.log("  API OK — passkey valide.", "ok")
+                    return True
+            except Exception:
+                continue
+        self.log(f"  Erreur API (HTTP 401) — vérifiez le passkey.", "err")
+        return False
 
     def prepare_api(self):
         """Récupère catégories via API externe."""
         try:
             r = self.sess.get(f"{self.url}/api/external/meta",
-                              params={"passkey": self._passkey}, timeout=10)
+                              params={"apikey": self._passkey}, timeout=10)
             meta = r.json()
             cats = meta.get("categories") or []
             for c in cats:
@@ -857,7 +878,7 @@ class LaCale:
         tag_params = [("tags", tid) for tid in (terms or [])]
         r = self.sess.post(
             f"{self.url}/api/external/upload",
-            params=[("passkey", passkey)] + tag_params,
+            params=[("apikey", passkey)] + tag_params,
             data=data, files=files,
             headers={"Accept": "application/json"},
             timeout=120)
@@ -2076,6 +2097,15 @@ class App:
         root.option_add("*TCombobox*Listbox.background",   C["ibg"])
         root.option_add("*TCombobox*Listbox.selectForeground", C["gold"])
         root.option_add("*TCombobox*Listbox.selectBackground", C["border"])
+        root.option_add("*TCombobox*Listbox.relief",        "flat")
+        root.option_add("*TCombobox*Listbox.borderWidth",   "0")
+        # Forcer la couleur de fond du popup (Windows ignore parfois option_add)
+        root.tk.eval(f"""
+            ttk::style configure BF.TCombobox \
+                -fieldbackground {C['ibg']} \
+                -background {C['ibg']} \
+                -foreground {C['ifg']}
+        """)
 
         # Langue UI (chargée depuis config, défaut fr)
         global _lang
@@ -2528,14 +2558,20 @@ class App:
         st.configure("BF.TCombobox",
                      fieldbackground=C["ibg"], background=C["ibg"],
                      foreground=C["ifg"], selectbackground=C["ibg"],
-                     selectforeground=C["gold"], bordercolor=C["border"],
-                     arrowcolor=C["gold"], insertcolor=C["ifg"])
-        # Sur Windows, 'readonly' masque parfois le texte — on mappe via element
+                     selectforeground=C["gold"],
+                     bordercolor=C["border"],
+                     lightcolor=C["border"], darkcolor=C["border"],
+                     borderwidth=1,
+                     arrowcolor=C["gold"], insertcolor=C["ifg"],
+                     relief="flat")
         st.map("BF.TCombobox",
                fieldbackground=[("readonly", C["ibg"])],
                foreground=[("readonly", C["ifg"]), ("disabled", C["muted"])],
                selectbackground=[("readonly", C["ibg"])],
-               selectforeground=[("readonly", C["gold"])])
+               selectforeground=[("readonly", C["gold"])],
+               bordercolor=[("readonly", C["border"]), ("focus", C["border"])],
+               lightcolor=[("readonly", C["border"]), ("focus", C["border"])],
+               darkcolor=[("readonly", C["border"]), ("focus", C["border"])])
         cb = ttk.Combobox(parent, textvariable=var, values=values,
                           width=width, style="BF.TCombobox", state="readonly")
         # Force le rafraîchissement du texte affiché après création
@@ -2615,52 +2651,54 @@ class App:
         r = sec(r, "sec_lacale")
         r = row(r, "lbl_lacale_url", "lacale_url", w=38)
 
-        # Champ Passkey (mode API) — stocké, affiché/masqué selon mode
-        lbl_pk = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
-                          anchor="w", width=24)
-        lbl_pk.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+        # ── Frame API (passkey) ───────────────────────────────────────────
+        self._frame_api = tk.Frame(p, bg=C["bg"])
+        self._frame_api.grid(row=r, column=0, columnspan=4, sticky="ew")
+
+        lbl_pk = tk.Label(self._frame_api, text="", font=FL, bg=C["bg"],
+                          fg=C["muted"], anchor="w", width=24)
+        lbl_pk.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=1)
         self._s_labels["row_lbl_passkey"] = (lbl_pk, "lbl_passkey")
         self.vars["lacale_passkey"] = tk.StringVar()
-        pk_entry = tk.Entry(p, textvariable=self.vars["lacale_passkey"],
+        pk_entry = tk.Entry(self._frame_api, textvariable=self.vars["lacale_passkey"],
                             show="*", font=FM, bg=C["ibg"], fg=C["ifg"],
                             insertbackground=C["gold"], relief="flat", bd=0,
                             highlightthickness=1, highlightbackground=C["border"], width=38)
-        pk_entry.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
-        pk_link = tk.Label(p, text="", font=("Courier New", 8, "underline"),
+        pk_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=1)
+        self._frame_api.columnconfigure(1, weight=1)
+        pk_link = tk.Label(self._frame_api, text="", font=("Courier New", 8, "underline"),
                            bg=C["bg"], fg=C["gold_dim"], cursor="hand2")
-        pk_link.grid(row=r, column=2, sticky="w")
+        pk_link.grid(row=0, column=2, sticky="w")
         pk_link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
             "https://la-cale.space/settings/api-keys"))
         self._s_labels["lbl_passkey_hint_lbl"] = (pk_link, "lbl_passkey_hint")
-        # Stocker les widgets "mode API"
-        self._api_rows = [lbl_pk, pk_entry, pk_link]
         r += 1
 
-        # Champs Email + Pass (mode Web)
-        lbl_em = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
-                          anchor="w", width=24)
-        lbl_em.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+        # ── Frame Web (email + pass) ──────────────────────────────────────
+        self._frame_web = tk.Frame(p, bg=C["bg"])
+        self._frame_web.grid(row=r, column=0, columnspan=4, sticky="ew")
+
+        lbl_em = tk.Label(self._frame_web, text="", font=FL, bg=C["bg"],
+                          fg=C["muted"], anchor="w", width=24)
+        lbl_em.grid(row=0, column=0, sticky="w", padx=(8, 0), pady=1)
         self._s_labels["row_lbl_email"] = (lbl_em, "lbl_email")
         self.vars["lacale_user"] = tk.StringVar()
-        em_entry = tk.Entry(p, textvariable=self.vars["lacale_user"],
-                            font=FM, bg=C["ibg"], fg=C["ifg"],
-                            insertbackground=C["gold"], relief="flat", bd=0,
-                            highlightthickness=1, highlightbackground=C["border"], width=30)
-        em_entry.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
-        r += 1
+        tk.Entry(self._frame_web, textvariable=self.vars["lacale_user"],
+                 font=FM, bg=C["ibg"], fg=C["ifg"],
+                 insertbackground=C["gold"], relief="flat", bd=0,
+                 highlightthickness=1, highlightbackground=C["border"], width=30
+                 ).grid(row=0, column=1, sticky="w", padx=4, pady=1)
 
-        lbl_pw = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
-                          anchor="w", width=24)
-        lbl_pw.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+        lbl_pw = tk.Label(self._frame_web, text="", font=FL, bg=C["bg"],
+                          fg=C["muted"], anchor="w", width=24)
+        lbl_pw.grid(row=1, column=0, sticky="w", padx=(8, 0), pady=1)
         self._s_labels["row_lbl_pass"] = (lbl_pw, "lbl_pass")
         self.vars["lacale_pass"] = tk.StringVar()
-        pw_entry = tk.Entry(p, textvariable=self.vars["lacale_pass"],
-                            show="*", font=FM, bg=C["ibg"], fg=C["ifg"],
-                            insertbackground=C["gold"], relief="flat", bd=0,
-                            highlightthickness=1, highlightbackground=C["border"], width=24)
-        pw_entry.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
-        # Stocker les widgets "mode Web"
-        self._web_rows = [lbl_em, em_entry, lbl_pw, pw_entry]
+        tk.Entry(self._frame_web, textvariable=self.vars["lacale_pass"],
+                 show="*", font=FM, bg=C["ibg"], fg=C["ifg"],
+                 insertbackground=C["gold"], relief="flat", bd=0,
+                 highlightthickness=1, highlightbackground=C["border"], width=24
+                 ).grid(row=1, column=1, sticky="w", padx=4, pady=1)
         r += 1
 
         r = row(r, "lbl_tracker", "tracker_url", w=52)
@@ -2892,11 +2930,20 @@ class App:
         self._s_labels["row_lbl_check_updates"] = (lbl_cu, "lbl_check_updates")
 
         self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
+        cu_frame = tk.Frame(p, bg=C["bg"])
+        cu_frame.grid(row=r, column=1, columnspan=3, sticky="w", pady=(6, 2))
+
         self._btn_check_updates = tk.Button(
-            p, text="", font=FB,
+            cu_frame, text="", font=FB,
             bg=C["panel"], relief="flat", bd=0, padx=8, pady=3,
             cursor="hand2", command=self._toggle_check_updates)
-        self._btn_check_updates.grid(row=r, column=1, sticky="w", padx=4, pady=(6, 2))
+        self._btn_check_updates.pack(side="left")
+
+        tk.Label(cu_frame,
+                 text="  (Vérifie sur Github du num. de version du raw en début de session)",
+                 font=FM8, bg=C["bg"], fg=C["muted"]
+                 ).pack(side="left")
+
         p.after(30, self._refresh_check_updates_ui)
         r += 1
 
@@ -3478,7 +3525,7 @@ class App:
         self._watcher = SiteWatcher(url, interval, self._on_site_back)
         self._watcher.start()
         self._log(
-            f"  Surveillance tierce activée — vérification toutes les {interval} min.", "muted")
+            f"  Surveillance de la santé du site par un watcher extérieur activée — vérification toutes les {interval} min.", "muted")
 
     def _on_site_back(self):
         """Callback appelé par le watcher quand le site revient."""
@@ -3559,12 +3606,14 @@ class App:
                 text=f"  {t('conn_web')}  ",
                 fg=C["gold"], highlightthickness=1,
                 highlightbackground=C["gold"])
-        # Afficher/masquer les champs selon le mode — déclenché après _build_settings
-        if hasattr(self, "_web_rows") and hasattr(self, "_api_rows"):
-            for w in self._web_rows:
-                w.grid() if self._conn_mode == "web" else w.grid_remove()
-            for w in self._api_rows:
-                w.grid() if self._conn_mode == "api" else w.grid_remove()
+        # Afficher/masquer les frames selon le mode
+        if hasattr(self, "_frame_api") and hasattr(self, "_frame_web"):
+            if self._conn_mode == "api":
+                self._frame_api.grid()
+                self._frame_web.grid_remove()
+            else:
+                self._frame_api.grid_remove()
+                self._frame_web.grid()
 
     def _toggle_conn_mode(self):
         """Bascule entre mode API et mode Web."""
@@ -3624,6 +3673,14 @@ class App:
 
     def _collect(self):
         cfg = {k: v.get().strip() for k, v in self.vars.items()}
+        # États gérés hors self.vars
+        cfg["conn_mode"]       = getattr(self, "_conn_mode", "web")
+        cfg["torrent_client"]  = getattr(self, "_torrent_client", "qbittorrent")
+        cfg["autosave_enabled"]= getattr(self, "_autosave_enabled", True)
+        cfg["notify_enabled"]  = getattr(self, "_notify_enabled", False)
+        cfg["save_logs"]       = getattr(self, "_save_logs_enabled", True)
+        cfg["save_curl"]       = getattr(self, "_save_curl_enabled", True)
+        cfg["check_updates"]   = getattr(self, "_check_updates_enabled", True)
         # Champ dev (invisible) — jamais sauvegardé dans la config
         if hasattr(self, "_suffix_var"):
             cfg["_dev_field"] = self._suffix_var.get()
