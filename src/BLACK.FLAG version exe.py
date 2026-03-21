@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BLACK FLAG v1.2 — Upload automatique vers La Cale
+BLACK FLAG v1.3 — Upload automatique vers La Cale
 Développé par Theolddispatch & The40n8  ·  version exécutable
 
 Logique séries :
@@ -59,6 +59,29 @@ _PYGAME_OK = _bootstrap_pygame()
 if _PYGAME_OK:
     import pygame
 
+
+def _bootstrap_mediainfo():
+    """Auto-installe pymediainfo si absent — nécessaire pour le NFO complet."""
+    try:
+        from pymediainfo import MediaInfo; return True
+    except ImportError:
+        pass
+    try:
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "pymediainfo"],
+            timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **kwargs)
+        from pymediainfo import MediaInfo; return True
+    except Exception:
+        return False
+
+_MEDIAINFO_OK = _bootstrap_mediainfo()
+if _MEDIAINFO_OK:
+    from pymediainfo import MediaInfo as _MediaInfo
+
 # ══════════════════════════════════════════════════════════════════════════════
 # IMPORTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -108,8 +131,8 @@ PLAYLIST = [
      "https://opengameart.org/sites/default/files/pirate.mp3"),
 ]
 
-APP_VERSION   = "1.2"
-APP_NEW_UPDATES = "v1.2 — MAJ Web, vérification seed avant upload"
+APP_VERSION   = "1.3"
+APP_NEW_UPDATES = "v1.3 : Remplacez juste le fichier.py!\n- Login La Cale corrigé (/api/internal/auth/login)\n- Ajout de MediaInfo pour le .dll\n- Support Torr9\n- Fenêtre historique : date, état seed, tracker\n- Génération torrent + mise en seed QB avant upload\n- Logs horodatés (un fichier par session ou erreur)\n- Toggle vérification mises à jour\n- Vérification TMDb Bearer Token et MediaInfo au lancement (bloquant)\n- Support MediaInfo multi-OS (.dll Windows / .dylib macOS / .so Linux)\n- Tooltip QB path mis à jour"
 
 # URL du fichier source sur GitHub pour vérification de version
 _UPDATE_URL = (
@@ -285,6 +308,14 @@ DEFAULTS = {
     "qb_pass":         "",
     "qb_films_path":   "/Films",
     "qb_series_path":  "/Series",
+    "active_tracker":  "lacale",         # "lacale" ou "torr9"
+    "torr9_url":       "https://torr9.net/upload",
+    "torr9_user":      "",
+    "torr9_pass":      "",
+    "torr9_announce":  "https://tracker.torr9.net/announce/****A CHANGER****",
+    "mediainfo_dll":   "",
+    "mediainfo_dylib": "",
+    "mediainfo_so":    "",
     "torrent_client":  "qbittorrent",   # "qbittorrent" ou "transmission"
     "tr_url":          "http://192.168.1.x:9091",
     "tr_user":         "",
@@ -315,6 +346,30 @@ def save_cfg(d):
 # ══════════════════════════════════════════════════════════════════════════════
 # PARSING — FILMS (fichier individuel)
 # ══════════════════════════════════════════════════════════════════════════════
+def _unc_to_linux(path: str) -> str:
+    """
+    Retourne le chemin QB tel quel s'il est déjà un chemin Linux absolu.
+    Si c'est un chemin UNC Windows (//NAS/share/...), extrait uniquement
+    le dernier segment comme nom de montage Docker (ex: /Films).
+    
+    Exemples :
+      /Films                              → /Films  (inchangé)
+      //192.168.1.x/Mediathèque/.../Films → /Films  (dernier segment)
+    """
+    p = path.replace("\\", "/").rstrip("/")
+    # Déjà un chemin Linux absolu → retourner tel quel
+    if not p.startswith("//"):
+        return p
+    # Chemin UNC → extraire le dernier segment comme point de montage Docker
+    import re
+    m = re.match(r'^//[^/]+/(.+)$', p)
+    if m:
+        # Prendre uniquement le dernier segment du chemin UNC
+        segments = m.group(1).rstrip("/").split("/")
+        return "/" + segments[-1]
+    return p
+
+
 def parse_filename(filename):
     stem = Path(filename).stem
     su   = stem.upper()
@@ -496,7 +551,7 @@ def build_release_name_season(series_title, season_tag, p):
     return ".".join(parts)
 
 
-def scan_seasons(series_root: Path):
+def scan_seasons(series_root: Path, prog_cb=None):
     """
     Retourne la liste des dossiers de saison à traiter.
     Supporte :
@@ -519,6 +574,8 @@ def scan_seasons(series_root: Path):
                             for f in show_dir.iterdir() if f.is_file())
             if has_video:
                 seasons.append(show_dir)
+        if prog_cb:
+            prog_cb(len(seasons))
     return seasons
 
 
@@ -551,7 +608,43 @@ def _piece_length(total_size):
     else:                             return 4096 * 1024
 
 
-def make_torrent_single(fp: Path, tracker: str, prog_cb=None) -> bytes:
+def torrent_info_hash(torrent_bytes: bytes) -> str:
+    """Calcule l'info-hash SHA1 d'un torrent à partir de ses bytes bencoded."""
+    import re as _re
+    # Trouver le début de la valeur 'info' dans le bencode
+    # Format: ...4:infod...e... → on cherche '4:info' puis on extrait la valeur
+    marker = b'4:info'
+    idx = torrent_bytes.find(marker)
+    if idx == -1:
+        return ""
+    info_start = idx + len(marker)
+    # La valeur info est un dict bencoded — on trouve sa fin
+    # On bencode/décode pour extraire précisément
+    try:
+        def _bdecode_len(data, pos):
+            """Retourne la position de fin de la valeur bencoded à pos."""
+            c = chr(data[pos])
+            if c == 'i':
+                end = data.index(ord('e'), pos + 1)
+                return end + 1
+            elif c == 'l' or c == 'd':
+                pos += 1
+                while chr(data[pos]) != 'e':
+                    pos = _bdecode_len(data, pos)
+                return pos + 1
+            elif c.isdigit():
+                colon = data.index(ord(':'), pos)
+                n = int(data[pos:colon])
+                return colon + 1 + n
+            return pos + 1
+        info_end = _bdecode_len(torrent_bytes, info_start)
+        info_bytes = torrent_bytes[info_start:info_end]
+        return hashlib.sha1(info_bytes).hexdigest()
+    except Exception:
+        return ""
+
+
+def make_torrent_single(fp: Path, tracker: str, prog_cb=None, source: str = "lacale") -> bytes:
     """Torrent single-file (films)."""
     sz = fp.stat().st_size
     pl = _piece_length(sz)
@@ -565,16 +658,21 @@ def make_torrent_single(fp: Path, tracker: str, prog_cb=None) -> bytes:
             read   += len(chunk)
             if prog_cb: prog_cb(read / sz)
     info = {"name": fp.name, "piece length": pl, "pieces": bytes(pieces),
-            "length": sz, "private": 1, "source": "lacale"}
+            "length": sz, "private": 1, "source": source}
     return bencode({"announce": tracker, "info": info,
                     "created by": "BLACK FLAG", "creation date": int(time.time())})
 
 
-def make_torrent_multi(folder_name: str, files: list, tracker: str, prog_cb=None) -> bytes:
+def make_torrent_multi(folder_name: str, files: list, tracker: str, prog_cb=None,
+                       source: str = "lacale") -> bytes:
     """
     Torrent multi-fichiers (saisons de séries).
-    folder_name : nom du dossier racine dans le torrent (= release_name)
+    folder_name : nom du dossier racine dans le torrent (= release_name, pour l'upload)
     files       : liste de Path, tous dans le même dossier physique
+
+    IMPORTANT pour le seeding : le torrent.name = release_name, mais les fichiers
+    physiques sont dans season_dir. qBittorrent fait le lien grâce à skip_checking=true
+    + savepath pointant vers le dossier PARENT de season_dir.
     """
     total_size = sum(f.stat().st_size for f in files)
     pl         = _piece_length(total_size)
@@ -607,7 +705,7 @@ def make_torrent_multi(folder_name: str, files: list, tracker: str, prog_cb=None
         "pieces":       bytes(pieces),
         "files":        file_list,
         "private":      1,
-        "source":       "lacale",
+        "source":       source,
     }
     return bencode({"announce": tracker, "info": info,
                     "created by": "BLACK FLAG", "creation date": int(time.time())})
@@ -731,7 +829,7 @@ class LaCale:
         self.log("Connexion à La Cale...", "gold")
         token = ""
         try:
-            ch = self._get("/api/auth/altcha/challenge?scope=login",
+            ch = self._get("/api/internal/auth/altcha/challenge?scope=login",
                            headers={"Accept": "application/json",
                                     "Referer": self.url + "/login"}).json()
             token = self._solve_altcha(ch)
@@ -741,7 +839,7 @@ class LaCale:
         payload = {"email": email, "password": pwd,
                    "formLoadedAt": int(time.time() * 1000)}
         if token: payload["altcha"] = token
-        r = self._post("/api/auth/login", json=payload,
+        r = self._post("/api/internal/auth/login", json=payload,
                        headers={"Content-Type": "application/json",
                                 "Accept": "application/json",
                                 "Referer": self.url + "/login",
@@ -769,8 +867,9 @@ class LaCale:
     def prepare(self):
         """Découvre les catégories Films et Séries + les termIds de quais."""
         try:
-            cats = self._get("/api/internal/categories",
-                             headers={"Accept": "application/json"}).json()
+            r_cats = self._get("/api/internal/categories",
+                             headers={"Accept": "application/json"})
+            cats = r_cats.json()
             if not isinstance(cats, list):
                 cats = cats.get("data") or cats.get("categories") or []
             for c in cats:
@@ -779,7 +878,7 @@ class LaCale:
                     self.cat_film = c["id"]
                 if re.search(r"serie|tv|show", name) and not self.cat_series:
                     self.cat_series = c["id"]
-        except Exception:
+        except Exception as e:
             pass
         if not self.cat_film:   self.cat_film   = "cmjoyv2cd00027eryreyk39gz"
         if not self.cat_series: self.cat_series = self.cat_film   # fallback
@@ -788,8 +887,9 @@ class LaCale:
 
         # Quais depuis la catégorie films
         try:
-            groups = self._get(f"/api/internal/categories/{self.cat_film}/terms",
-                               headers={"Accept": "application/json"}).json()
+            r_terms = self._get(f"/api/internal/categories/{self.cat_film}/terms",
+                               headers={"Accept": "application/json"})
+            groups = r_terms.json()
             if not isinstance(groups, list):
                 groups = groups.get("data") or groups.get("termGroups") or []
             for g in groups:
@@ -803,7 +903,7 @@ class LaCale:
                         elif "remux" in n:                                self.quais["REMUX"]  = t["id"]
                         elif "dvd"   in n:                                self.quais["DVDRip"] = t["id"]
                         elif "hdtv"  in n:                                self.quais["HDTV"]   = t["id"]
-        except Exception:
+        except Exception as e:
             pass
 
     def count(self, title, is_series=False):
@@ -922,8 +1022,173 @@ class LaCale:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TMDb CLIENT
+# TORR9 CLIENT  (Web only — JWT Bearer token via localStorage)
 # ══════════════════════════════════════════════════════════════════════════════
+class Torr9:
+    """
+    Client d'upload pour Torr9.
+    Authentification : login form → JWT token (stocké côté client dans localStorage).
+    Upload : POST multipart vers https://api.torr9.net/api/v1/torrents/upload
+             avec Authorization: Bearer <token>.
+
+    Catégories détectées depuis le JS du site (chunk 33245) :
+      Films   → id=1  / Séries TV → id=4
+      Sous-catégories Films  : 51=Films, 2=Films d'animation, 3=Documentaires
+      Sous-catégories Séries : 5=Séries TV, 7=Séries Animées
+    """
+
+    API_BASE    = "https://api.torr9.net"
+    CAT_FILMS   = 1     # "Films"
+    CAT_SERIES  = 4     # "Séries"
+    SUBCAT_FILM = 51    # "Films" (sous-catégorie générique)
+    SUBCAT_TV   = 5     # "Séries TV"
+
+    def __init__(self, url, log):
+        self.url   = url.rstrip("/")      # https://www.torr9.net
+        self.log   = log
+        self.sess  = requests.Session()
+        self.sess.headers.update({
+            "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Origin":  "https://torr9.net",
+            "Referer": "https://torr9.net/",
+        })
+        self._token = ""
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
+    def login(self, username: str, password: str) -> bool:
+        """Obtient un JWT Bearer depuis /api/v1/auth/login."""
+        self.log("Connexion à Torr9...", "gold")
+        try:
+            r = requests.post(
+                f"{self.API_BASE}/api/v1/auth/login",
+                json={"username": username, "password": password},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept":       "application/json",
+                    "Origin":       "https://torr9.net",
+                    "Referer":      "https://torr9.net/login",
+                },
+                timeout=20)
+            body = {}
+            try:
+                body = r.json()
+            except Exception:
+                pass
+            token = body.get("token") or body.get("access_token") or ""
+            if r.status_code == 200 and token:
+                self._token = token
+                self.log("  Connexion Torr9 OK.", "ok")
+                return True
+            err = body.get("error") or body.get("message") or f"HTTP {r.status_code}"
+            self.log(f"  Erreur login Torr9 : {err}", "err")
+            return False
+        except Exception as e:
+            self.log(f"  Erreur connexion Torr9 : {e}", "err")
+            return False
+
+    def _auth_headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Accept":        "application/json",
+            "Origin":        "https://torr9.net",
+            "Referer":       "https://torr9.net/upload",
+        }
+
+    # ── Health check ─────────────────────────────────────────────────────────
+    def health_check(self):
+        """Vérifie que Torr9 répond (HEAD direct)."""
+        self.log("  Passe — Connexion directe à Torr9...", "muted")
+        try:
+            r = requests.head(self.url, timeout=10,
+                              headers={"User-Agent": self.sess.headers["User-Agent"]})
+            if r.status_code in (200, 301, 302, 307, 308):
+                self.log(f"  ✓ Torr9 répond (HTTP {r.status_code}).", "ok")
+                return True, "OK"
+            self.log(f"  ✗ Torr9 : HTTP {r.status_code}.", "err")
+            return False, f"Torr9 répond HTTP {r.status_code}."
+        except requests.exceptions.ConnectionError:
+            self.log("  ✗ Torr9 inaccessible (erreur réseau).", "err")
+            return False, "Impossible de joindre Torr9."
+        except requests.exceptions.Timeout:
+            self.log("  ✗ Torr9 timeout.", "err")
+            return False, "Torr9 ne répond pas (timeout)."
+        except Exception as e:
+            self.log(f"  ✗ Torr9 : {e}", "err")
+            return False, str(e)
+
+    # ── Duplicate check ──────────────────────────────────────────────────────
+    def check_duplicate(self, title: str) -> bool:
+        """Retourne True si un doublon existe déjà sur Torr9."""
+        try:
+            r = requests.post(
+                f"{self.API_BASE}/api/v1/torrents/check-duplicate",
+                json={"title": title},
+                headers=self._auth_headers() | {"Content-Type": "application/json"},
+                timeout=10)
+            if r.status_code == 200:
+                body = r.json()
+                return bool(body.get("has_duplicates"))
+        except Exception:
+            pass
+        return False
+
+    # ── Upload ───────────────────────────────────────────────────────────────
+    def upload(self, name: str, tb: bytes, desc: str,
+               is_series: bool = False, tmdb_id=None, nfo: str = "") -> tuple:
+        """
+        Envoie le torrent vers api.torr9.net/api/v1/torrents/upload.
+        Retourne (ok: bool, body: dict).
+        """
+        cat    = self.CAT_SERIES  if is_series else self.CAT_FILMS
+        subcat = self.SUBCAT_TV   if is_series else self.SUBCAT_FILM
+
+        # Construire les catégories sous forme de noms (le JS utilise les noms)
+        cat_name    = "Séries" if is_series else "Films"
+        subcat_name = "Séries TV" if is_series else "Films"
+
+        data = {
+            "title":        name,
+            "description":  desc or "",
+            "category":     cat_name,
+            "subcategory":  subcat_name,
+            "tags":         "",
+            "is_exclusive": "false",
+            "is_anonymous": "false",
+        }
+        if tmdb_id:
+            data["tmdb_id"] = str(tmdb_id)
+
+        files = {
+            "torrent_file": (f"{name}.torrent", tb, "application/x-bittorrent"),
+        }
+        if nfo:
+            # Torr9 attend le NFO comme champ texte dans le FormData (pas comme fichier)
+            data["nfo"] = nfo
+
+        try:
+            r = requests.post(
+                f"{self.API_BASE}/api/v1/torrents/upload",
+                data=data,
+                files=files,
+                headers=self._auth_headers(),
+                timeout=120)
+            body = {}
+            try:
+                body = r.json()
+            except Exception:
+                pass
+            ok = (r.status_code in (200, 201) and
+                  bool(body.get("torrent_id") or body.get("id") or
+                       body.get("success") or body.get("slug") or
+                       (r.status_code in (200, 201) and body)))
+            return ok, body
+        except Exception as e:
+            return False, {"error": str(e)}
+
+
+
 class TMDb:
     BASE = "https://api.themoviedb.org/3"
 
@@ -988,24 +1253,218 @@ class QBit:
         except Exception as e:
             self.log(f"  qBittorrent : {e}", "muted")
 
+    def is_seeding(self, file_path: str) -> bool:
+        """
+        Vérifie si un fichier peut être uploadé.
+
+        Cycle Prowlarr/QB :
+          1. Téléchargement → QB seed dans Torrents/complete/
+          2. Après période de seed → Prowlarr déplace vers Films/ et supprime de QB
+
+        Logique :
+          - Fichier trouvé dans QB avec état missingFiles/error → BLOQUÉ (fichier cassé)
+          - Fichier trouvé dans QB avec tout autre état → OK (en cours de seed)
+          - Fichier absent de QB → OK (a déjà seedé, déplacé par Prowlarr)
+        """
+        if not self.ok:
+            return True   # QB non connecté → on ne peut pas vérifier, on laisse passer
+        try:
+            r = self.sess.get(f"{self.url}/api/v2/torrents/info",
+                              params={"filter": "all"}, timeout=10)
+            if r.status_code != 200:
+                return True   # QB ne répond pas → on laisse passer
+
+            torrents = r.json()
+            fname = Path(file_path).name.lower()
+            fstem = Path(file_path).stem.lower()
+            BAD_STATES = {"missingFiles", "error"}
+
+            # ── Passe 1 : métadonnées ─────────────────────────────────────────
+            for torrent in torrents:
+                t_name    = (torrent.get("name")         or "").lower()
+                t_content = (torrent.get("content_path") or "").lower()
+                t_save    = (torrent.get("save_path")    or "").lower()
+                constructed = t_save.rstrip("/") + "/" + t_name
+
+                if (fname in t_content or fname in constructed
+                        or fname == t_name or fstem == t_name):
+                    state = torrent.get("state", "")
+                    if state in BAD_STATES:
+                        self.log(f"  [seed check] '{fname}' en erreur QB : {state}", "err")
+                        return False
+                    return True   # trouvé et état OK
+
+            # ── Passe 2 : liste de fichiers par torrent ───────────────────────
+            for torrent in torrents:
+                t_hash = torrent.get("hash", "")
+                if not t_hash:
+                    continue
+                try:
+                    rf = self.sess.get(f"{self.url}/api/v2/torrents/files",
+                                       params={"hash": t_hash}, timeout=5)
+                    if rf.status_code != 200:
+                        continue
+                    for f in rf.json():
+                        f_name = Path(f.get("name", "")).name.lower()
+                        if f_name == fname or Path(f_name).stem == fstem:
+                            state = torrent.get("state", "")
+                            if state in BAD_STATES:
+                                self.log(f"  [seed check] '{fname}' en erreur QB : {state}", "err")
+                                return False
+                            return True
+                except Exception:
+                    continue
+
+            # Absent de QB → a déjà seedé et été déplacé par Prowlarr → OK
+            return True
+        except Exception as e:
+            self.log(f"  [seed check] erreur API : {e}", "muted")
+            return True
+
+    def get_default_save_path(self) -> str:
+        """Récupère le chemin de sauvegarde par défaut configuré dans qBittorrent."""
+        try:
+            r = self.sess.get(f"{self.url}/api/v2/app/preferences", timeout=10)
+            if r.status_code == 200:
+                path = r.json().get("save_path", "")
+                if path:
+                    return path.rstrip("/")
+        except Exception:
+            pass
+        return ""
+
+    def get_torrent_state(self, release_name: str) -> str:
+        """
+        Retourne l'état d'un torrent dans QB par son nom de release.
+        Retourne '' si non trouvé.
+        """
+        try:
+            r = self.sess.get(f"{self.url}/api/v2/torrents/info",
+                              params={"filter": "all"}, timeout=10)
+            if r.status_code != 200:
+                return ""
+            name_lower = release_name.lower()
+            for torrent in r.json():
+                t_name = (torrent.get("name") or "").lower()
+                if name_lower in t_name or t_name in name_lower:
+                    state = torrent.get("state", "")
+                    cp    = torrent.get("content_path", "")
+                    return state
+        except Exception:
+            pass
+        return ""
+
+    def get_torrent_state_by_hash(self, info_hash: str) -> tuple:
+        """
+        Retourne (state, content_path) d'un torrent par son info-hash SHA1.
+        Plus fiable que la recherche par nom.
+        """
+        try:
+            r = self.sess.get(f"{self.url}/api/v2/torrents/info",
+                              params={"filter": "all", "hashes": info_hash}, timeout=10)
+            if r.status_code != 200:
+                return "", ""
+            torrents = r.json()
+            if torrents:
+                t = torrents[0]
+                state = t.get("state", "")
+                cp    = t.get("content_path", "")
+                if state == "missingFiles":
+                    self.log(f"  QB cherche : {cp}", "err")
+                return state, cp
+        except Exception:
+            pass
+        return "", ""
+
+    def is_seeding_by_name(self, release_name: str) -> bool:
+        """
+        Vérifie si un torrent est en seed dans QB par son release name.
+        Retourne True si trouvé avec un état valide (pas missingFiles/error).
+        """
+        GOOD_STATES = {"uploading", "stalledUP", "forcedUP", "queuedUP",
+                       "checkingUP", "stoppedUP", "pausedUP", "moving"}
+        try:
+            r = self.sess.get(f"{self.url}/api/v2/torrents/info",
+                              params={"filter": "all"}, timeout=10)
+            if r.status_code != 200:
+                return False
+            name_low = release_name.lower()
+            for t in r.json():
+                t_name = (t.get("name") or "").lower()
+                if name_low in t_name or t_name in name_low:
+                    return t.get("state", "") in GOOD_STATES
+        except Exception:
+            pass
+        return False
+
+    def find_error_torrent_by_name(self, name: str) -> str:
+        """
+        Cherche un torrent en erreur (missingFiles/error) par nom approximatif.
+        Retourne l'info-hash si trouvé en erreur, sinon ''.
+        """
+        try:
+            r = self.sess.get(f"{self.url}/api/v2/torrents/info",
+                              params={"filter": "all"}, timeout=10)
+            if r.status_code != 200:
+                return ""
+            name_low = name.lower()
+            for t in r.json():
+                if t.get("state", "") in ("missingFiles", "error"):
+                    t_name = (t.get("name") or "").lower()
+                    if name_low in t_name or t_name in name_low:
+                        return t.get("hash", "")
+        except Exception:
+            pass
+        return ""
+
+    def delete_torrent(self, info_hash: str, delete_files: bool = False) -> bool:
+        """Supprime un torrent de QB (sans supprimer les fichiers par défaut)."""
+        try:
+            r = self.sess.post(f"{self.url}/api/v2/torrents/delete",
+                               data={"hashes": info_hash,
+                                     "deleteFiles": "true" if delete_files else "false"},
+                               timeout=10)
+            return r.status_code == 200
+        except Exception:
+            return False
+
     def add(self, tb, save_path, torrent_name):
+        """
+        Ajoute un torrent dans qBittorrent.
+        save_path doit pointer vers le dossier contenant le fichier existant.
+        """
         try:
             r = self.sess.post(f"{self.url}/api/v2/torrents/add",
                                files={"torrents": (torrent_name + ".torrent", tb,
                                                    "application/x-bittorrent")},
-                               data={"savepath": save_path,
-                                     "skip_checking": "true", "paused": "false"},
+                               data={"savepath":      save_path,
+                                     "skip_checking": "true",
+                                     "paused":        "false"},
                                timeout=30)
-            return r.status_code == 200 and "ok" in r.text.lower()
-        except Exception: return False
+            ok = r.status_code == 200 and "ok" in r.text.lower()
+            if not ok:
+                if "fails" in r.text.lower():
+                    # Torrent déjà présent dans QB (même hash) → on continue
+                    self.log("  QB add → torrent déjà présent dans QB.", "muted")
+                    return True
+                self.log(f"  QB add → HTTP {r.status_code} : {r.text[:200]}", "err")
+            return ok
+        except Exception as e:
+            self.log(f"  QB add → exception : {e}", "err")
+            return False
 
-    def is_checking(self):
-        """Retourne True si au moins un torrent est en cours de vérification (checking)."""
+    def set_location(self, info_hash: str, location: str) -> bool:
+        """
+        Force le chemin de sauvegarde d'un torrent via setLocation.
+        Contourne la normalisation Unicode faite par QB lors de l'ajout.
+        """
         try:
-            r = self.sess.get(f"{self.url}/api/v2/torrents/info",
-                              params={"filter": "checking"}, timeout=10)
-            return bool(r.json())
-        except Exception: return False
+            r = self.sess.post(f"{self.url}/api/v2/torrents/setLocation",
+                               data={"hashes": info_hash, "location": location},
+                               timeout=10)
+            return r.status_code == 200
+        except Exception:
+            return False
 
 
 class Transmission:
@@ -1053,19 +1512,276 @@ class Transmission:
         except Exception:
             return False
 
-    def is_checking(self):
-        """Retourne True si au moins un torrent est en cours de vérification."""
-        try:
-            payload = {"method": "torrent-get",
-                       "arguments": {"fields": ["status"]}}
-            r = requests.post(f"{self.url}/transmission/rpc",
-                              json=payload,
-                              headers={"X-Transmission-Session-Id": self._sid},
-                              auth=self._auth, timeout=10)
-            torrents = r.json().get("arguments", {}).get("torrents", [])
-            # Status 2 = checking dans Transmission
-            return any(t.get("status") == 2 for t in torrents)
-        except Exception: return False
+
+
+def _L(label, value):
+    """Formate une ligne NFO style MediaInfo alignée."""
+    return f"{label:<41}: {value}"
+
+
+def _mediainfo_block(fp):
+    """
+    Retourne un dict avec toutes les pistes MediaInfo du fichier.
+    Retourne None si pymediainfo n'est pas disponible ou échoue.
+    """
+    if not _MEDIAINFO_OK:
+        return None
+    try:
+        mi = _MediaInfo.parse(str(fp))
+        result = {"general": {}, "video": [], "audio": [], "text": []}
+        for track in mi.tracks:
+            t = track.track_type
+            d = track.to_data()
+            if t == "General":
+                result["general"] = d
+            elif t == "Video":
+                result["video"].append(d)
+            elif t == "Audio":
+                result["audio"].append(d)
+            elif t == "Text":
+                result["text"].append(d)
+        return result
+    except Exception:
+        return None
+
+
+def _fmt_bitrate(bps):
+    if not bps: return "N/A"
+    try:
+        bps = int(bps)
+        if bps >= 1_000_000: return f"{bps/1_000_000:.1f} Mb/s"
+        return f"{bps//1000} kb/s"
+    except Exception: return str(bps)
+
+
+def _fmt_size(b):
+    try:
+        b = int(b)
+        if b >= 1024**3: return f"{b/1024**3:.2f} GiB"
+        if b >= 1024**2: return f"{b/1024**2:.0f} MiB"
+        return f"{b//1024} KiB"
+    except Exception: return str(b)
+
+
+def _fmt_duration(ms):
+    try:
+        ms = int(float(ms))
+        h, rem = divmod(ms // 1000, 3600)
+        m, s   = divmod(rem, 60)
+        return f"{h} h {m:02d} min" if h else f"{m} min {s:02d} s"
+    except Exception: return str(ms)
+
+
+def make_nfo_film(fp, p, title, year, tmdb_id, imdb_id, rating, genres, sz):
+    """Génère un NFO style MediaInfo complet pour un film."""
+    mi = _mediainfo_block(fp)
+
+    lines = ["General"]
+
+    if mi:
+        g = mi["general"]
+        lines += [
+            _L("Complete name",          fp.name),
+            _L("Format",                 g.get("format", "Matroska")),
+            _L("Format version",         g.get("format_version", "")),
+            _L("File size",              _fmt_size(g.get("file_size", sz))),
+            _L("Duration",               _fmt_duration(g.get("duration", ""))),
+            _L("Overall bit rate mode",  g.get("overall_bit_rate_mode", "Variable")),
+            _L("Overall bit rate",       _fmt_bitrate(g.get("overall_bit_rate", ""))),
+            _L("Frame rate",             f"{float(g['frame_rate']):.3f} FPS" if g.get("frame_rate") else ""),
+            _L("Writing application",    g.get("writing_application", "")),
+        ]
+        # Video
+        for i, v in enumerate(mi["video"], 1):
+            lines += ["", f"Video{' #'+str(i) if len(mi['video'])>1 else ''}"]
+            lines += [
+                _L("Format",              v.get("format", "")),
+                _L("Format/Info",         v.get("format_info", "") or v.get("format_profile", "")),
+                _L("Format profile",      v.get("format_profile", "")),
+                _L("HDR format",          v.get("hdr_format", "") or v.get("hdr_format_commercial", "")),
+                _L("Codec ID",            v.get("codec_id", "")),
+                _L("Duration",            _fmt_duration(v.get("duration", ""))),
+                _L("Bit rate",            _fmt_bitrate(v.get("bit_rate", ""))),
+                _L("Width",               f"{int(v['width']):,} pixels".replace(",", " ") if v.get("width") else ""),
+                _L("Height",              f"{int(v['height']):,} pixels".replace(",", " ") if v.get("height") else ""),
+                _L("Display aspect ratio",v.get("display_aspect_ratio", "")),
+                _L("Frame rate mode",     v.get("frame_rate_mode", "")),
+                _L("Frame rate",          f"{float(v['frame_rate']):.3f} FPS" if v.get("frame_rate") else ""),
+                _L("Bit depth",           f"{v['bit_depth']} bits" if v.get("bit_depth") else ""),
+                _L("Color primaries",     v.get("color_primaries", "")),
+                _L("Transfer char.",      v.get("transfer_characteristics", "")),
+                _L("Original source",     v.get("original_source_medium", "")),
+                _L("Language",            v.get("language", "")),
+                _L("Stream size",         _fmt_size(v.get("stream_size", ""))),
+            ]
+        # Audio
+        for i, a in enumerate(mi["audio"], 1):
+            lines += ["", f"Audio{' #'+str(i) if len(mi['audio'])>1 else ''}"]
+            lines += [
+                _L("Format",              a.get("format", "")),
+                _L("Format/Info",         a.get("format_info", "") or a.get("commercial_name", "") or a.get("format_commercial", "")),
+                _L("Commercial name",     a.get("commercial_name", "") or a.get("format_commercial", "")),
+                _L("Codec ID",            a.get("codec_id", "")),
+                _L("Duration",            _fmt_duration(a.get("duration", ""))),
+                _L("Bit rate mode",       a.get("bit_rate_mode", "")),
+                _L("Bit rate",            _fmt_bitrate(a.get("bit_rate", ""))),
+                _L("Channel(s)",          f"{a['channel_s']} channels" if a.get("channel_s") else ""),
+                _L("Channel layout",      a.get("channel_layout", "")),
+                _L("Sampling rate",       f"{int(a['sampling_rate'])//1000:.1f} kHz" if a.get("sampling_rate") else ""),
+                _L("Bit depth",           f"{a['bit_depth']} bits" if a.get("bit_depth") else ""),
+                _L("Compression mode",    a.get("compression_mode", "")),
+                _L("Title",               a.get("title", "")),
+                _L("Language",            a.get("language", "")),
+                _L("Default",             a.get("default", "")),
+                _L("Forced",              a.get("forced", "")),
+                _L("Stream size",         _fmt_size(a.get("stream_size", ""))),
+            ]
+        # Subtitles
+        for i, t in enumerate(mi["text"], 1):
+            lines += ["", f"Text{' #'+str(i) if len(mi['text'])>1 else ''}"]
+            lines += [
+                _L("Format",     t.get("format", "")),
+                _L("Codec ID",   t.get("codec_id", "")),
+                _L("Language",   t.get("language", "")),
+                _L("Default",    t.get("default", "")),
+                _L("Forced",     t.get("forced", "")),
+            ]
+    else:
+        # Fallback depuis le nom de fichier
+        vc_map = {"x265": "HEVC", "x264": "AVC", "AV1": "AV1", "VC-1": "VC-1"}
+        ac_map = {"TrueHD": "Dolby TrueHD", "EAC3": "Dolby Digital Plus",
+                  "AC3": "Dolby Digital", "DTS-X": "DTS-X",
+                  "DTS-HD.MA": "DTS-HD Master Audio", "DTS-HD": "DTS-HD",
+                  "DTS": "DTS", "FLAC": "FLAC", "OPUS": "Opus", "AAC": "AAC"}
+        res_map = {"2160p": "3 840 x 2 160", "1080p": "1 920 x 1 080",
+                   "720p": "1 280 x 720", "480p": "720 x 480"}
+        vc_full = vc_map.get(p.get("vc", "x264"), p.get("vc", "x264"))
+        ac_full = ac_map.get(p.get("ac", "AAC"), p.get("ac", "AAC"))
+        if p.get("atmos"): ac_full += " with Dolby Atmos"
+        lines += [
+            _L("Complete name",   fp.name),
+            _L("Format",          "Matroska"),
+            _L("File size",       f"{sz/1024**3:.2f} GiB"),
+            "", "Video",
+            _L("Format",          vc_full),
+            _L("Width x Height",  res_map.get(p.get("res", ""), p.get("res", "N/A"))),
+            _L("HDR format",      p.get("hdr", "") or "SDR"),
+            _L("Original source", p.get("src", "WEB")),
+            "", "Audio",
+            _L("Format",          ac_full),
+            _L("Channel(s)",      p.get("ach", "N/A")),
+            _L("Language",        p.get("lang", "FRENCH")),
+        ]
+
+    # Métadonnées TMDb
+    lines += [
+        "",
+        "Metadata",
+        _L("Title",     f"{title} ({year})"),
+        _L("TMDb ID",   str(tmdb_id or "N/A")),
+        _L("IMDB ID",   str(imdb_id or "N/A")),
+        _L("Note TMDb", f"{rating}/10"),
+        _L("Genres",    genres or "N/A"),
+    ]
+
+    # Nettoyer les lignes vides consécutives et les valeurs vides
+    clean = []
+    for l in lines:
+        if l and ": " in l and l.split(": ", 1)[1].strip() == "":
+            continue  # ignorer les champs vides
+        clean.append(l)
+
+    return "\n".join(clean)
+
+
+def make_nfo_series(files, p, title, year, season_tag, tmdb_id, rating, genres, sz):
+    """Génère un NFO style MediaInfo complet pour une saison (analyse le 1er épisode)."""
+    # Analyser le premier épisode comme référence
+    ref_fp = files[0] if files else None
+    mi = _mediainfo_block(ref_fp) if ref_fp else None
+
+    lines = [
+        "General",
+        _L("Series name",  title),
+        _L("Season",       season_tag),
+        _L("Episodes",     str(len(files))),
+        _L("Total size",   f"{sz/1024**3:.2f} GiB"),
+        _L("Format",       "Matroska"),
+        _L("Source",       p.get("src", "WEB")),
+    ]
+
+    if mi:
+        # Video depuis le 1er épisode
+        for i, v in enumerate(mi["video"], 1):
+            lines += ["", f"Video{' #'+str(i) if len(mi['video'])>1 else ''}"]
+            lines += [
+                _L("Format",              v.get("format", "")),
+                _L("HDR format",          v.get("hdr_format", "") or v.get("hdr_format_commercial", "")),
+                _L("Width",               f"{int(v['width']):,} pixels".replace(",", " ") if v.get("width") else ""),
+                _L("Height",              f"{int(v['height']):,} pixels".replace(",", " ") if v.get("height") else ""),
+                _L("Frame rate",          f"{float(v['frame_rate']):.3f} FPS" if v.get("frame_rate") else ""),
+                _L("Bit depth",           f"{v['bit_depth']} bits" if v.get("bit_depth") else ""),
+                _L("Color primaries",     v.get("color_primaries", "")),
+            ]
+        # Audio
+        for i, a in enumerate(mi["audio"], 1):
+            lines += ["", f"Audio{' #'+str(i) if len(mi['audio'])>1 else ''}"]
+            lines += [
+                _L("Format",          a.get("format", "")),
+                _L("Commercial name", a.get("commercial_name", "") or a.get("format_commercial", "")),
+                _L("Channel(s)",      f"{a['channel_s']} channels" if a.get("channel_s") else ""),
+                _L("Bit rate",        _fmt_bitrate(a.get("bit_rate", ""))),
+                _L("Language",        a.get("language", "")),
+                _L("Title",           a.get("title", "")),
+            ]
+        # Sous-titres
+        for i, t in enumerate(mi["text"], 1):
+            lines += ["", f"Text{' #'+str(i) if len(mi['text'])>1 else ''}"]
+            lines += [
+                _L("Format",   t.get("format", "")),
+                _L("Language", t.get("language", "")),
+                _L("Forced",   t.get("forced", "")),
+            ]
+    else:
+        vc_map = {"x265": "HEVC", "x264": "AVC", "AV1": "AV1", "VC-1": "VC-1"}
+        ac_map = {"TrueHD": "Dolby TrueHD", "EAC3": "Dolby Digital Plus",
+                  "AC3": "Dolby Digital", "DTS-X": "DTS-X",
+                  "DTS-HD.MA": "DTS-HD Master Audio", "DTS-HD": "DTS-HD",
+                  "DTS": "DTS", "FLAC": "FLAC", "OPUS": "Opus", "AAC": "AAC"}
+        res_map = {"2160p": "3 840 x 2 160", "1080p": "1 920 x 1 080",
+                   "720p": "1 280 x 720", "480p": "720 x 480"}
+        vc_full = vc_map.get(p.get("vc", "x264"), p.get("vc", "x264"))
+        ac_full = ac_map.get(p.get("ac", "AAC"), p.get("ac", "AAC"))
+        if p.get("atmos"): ac_full += " with Dolby Atmos"
+        lines += [
+            "", "Video",
+            _L("Format",         vc_full),
+            _L("Width x Height", res_map.get(p.get("res", ""), p.get("res", "N/A"))),
+            _L("HDR format",     p.get("hdr", "") or "SDR"),
+            "", "Audio",
+            _L("Format",         ac_full),
+            _L("Channel(s)",     p.get("ach", "N/A")),
+            _L("Language",       p.get("lang", "FRENCH")),
+        ]
+
+    lines += [
+        "",
+        "Metadata",
+        _L("Title",     f"{title} — {season_tag}"),
+        _L("TMDb ID",   str(tmdb_id or "N/A")),
+        _L("Note TMDb", f"{rating}/10"),
+        _L("Genres",    genres or "N/A"),
+        "",
+        "Episodes",
+    ] + [f"  {f.name}" for f in files]
+
+    clean = []
+    for l in lines:
+        if l and ": " in l and l.split(": ", 1)[1].strip() == "":
+            continue
+        clean.append(l)
+
+    return "\n".join(clean)
 
 
 
@@ -1103,34 +1819,17 @@ def make_bbcode(title, year_or_tag, overview, poster, res, vc, ac, lang,
 # WORKER — Thread d'upload
 # ══════════════════════════════════════════════════════════════════════════════
 class Worker:
-    def __init__(self, cfg, log, done, prog, start_watcher_cb=None, set_count_cb=None):
+    def __init__(self, cfg, log, done, prog, start_watcher_cb=None, set_count_cb=None, curl_cb=None):
         self.cfg  = cfg
         self.log  = log
         self.done = done
         self.prog = prog
         self._start_watcher_cb = start_watcher_cb
         self._set_count        = set_count_cb or (lambda c, t: None)
+        self._curl_cb          = curl_cb or (lambda cmd: None)
         self._stop = threading.Event()
 
     def stop(self): self._stop.set()
-
-    def _wait_if_checking(self, qb, log):
-        """
-        Attend si le client torrent est en train de vérifier un torrent.
-        Annonce 30s d'attente, réessaie jusqu'à ce que ce soit libre.
-        """
-        if not qb.ok:
-            return
-        while not self._stop.is_set():
-            if not qb.is_checking():
-                break
-            log("  Client torrent en cours de montage — attente 30s...", "muted")
-            for _ in range(30):
-                if self._stop.is_set():
-                    return
-                time.sleep(1)
-        if not self._stop.is_set():
-            log("  Client torrent disponible — reprise.", "muted")
 
     def run(self):
         try:
@@ -1147,36 +1846,63 @@ class Worker:
         out.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+        active_tracker = cfg.get("active_tracker", "lacale")
+        use_torr9      = (active_tracker == "torr9")
+
         # ── Clients ──────────────────────────────────────────────────────────
-        lc = LaCale(cfg["lacale_url"], self.log)
+        if use_torr9:
+            # ── TORR9 ────────────────────────────────────────────────────────
+            t9_url = cfg.get("torr9_url", "https://www.torr9.net")
+            t9     = Torr9(t9_url, self.log)
 
-        # ── Health check (2 passes) ───────────────────────────────────────
-        self.log("Vérification de l'état du site La Cale...", "gold")
+            self.log("Vérification de l'état de Torr9...", "gold")
+            if _check_bypass(cfg.get("_dev_field", "")):
+                self.log("  ⚡ Mode bypass activé — vérification ignorée.", "gold")
+            else:
+                hc_ok, hc_msg = t9.health_check()
+                if not hc_ok:
+                    self.log(f"  Arrêt — {hc_msg}", "err")
+                    if self._start_watcher_cb:
+                        self._start_watcher_cb()
+                    return
 
-        # Code de bypass : si le champ dev contient le code, on saute le check
-        if _check_bypass(cfg.get("_dev_field", "")):
-            self.log("  ⚡ Mode bypass activé — vérification ignorée.", "gold")
-            self.log("  Si vous avez piraté le code, félicitations! Vous êtes un vrais pirate!", "err")
+            if not t9.login(cfg.get("torr9_user", ""), cfg.get("torr9_pass", "")):
+                self.log("Abandon — connexion Torr9 impossible.", "err"); return
+
+            lc        = None
+            conn_mode = "web"  # Torr9 = Web only
+            passkey   = ""
+
         else:
-            hc_ok, hc_msg = lc.health_check()
-            if not hc_ok:
-                self.log(f"  Arrêt — {hc_msg}", "err")
-                self.log("  Configurez la notification dans les réglages pour être averti quand il sera de retour.", "muted")
-                self.log("  Relancez une fois le site accessible.", "muted")
-                if self._start_watcher_cb:
-                    self._start_watcher_cb()
-                return
+            # ── LA CALE ──────────────────────────────────────────────────────
+            lc = LaCale(cfg["lacale_url"], self.log)
+            t9 = None
 
-        conn_mode = cfg.get("conn_mode", "web")
-        if conn_mode == "api":
-            passkey = cfg.get("lacale_passkey", "")
-            if not lc.login_api(passkey):
-                self.log("Abandon — vérifiez le passkey API.", "err"); return
-            lc.prepare_api()
-        else:
-            if not lc.login(cfg["lacale_user"], cfg["lacale_pass"]):
-                self.log("Abandon.", "err"); return
-            lc.prepare()
+            self.log("Vérification de l'état du site La Cale...", "gold")
+            if _check_bypass(cfg.get("_dev_field", "")):
+                self.log("  ⚡ Mode bypass activé — vérification ignorée.", "gold")
+                self.log("  Si vous avez piraté le code, félicitations! Vous êtes un vrais pirate!", "err")
+            else:
+                hc_ok, hc_msg = lc.health_check()
+                if not hc_ok:
+                    self.log(f"  Arrêt — {hc_msg}", "err")
+                    self.log("  Configurez la notification dans les réglages pour être averti quand il sera de retour.", "muted")
+                    self.log("  Relancez une fois le site accessible.", "muted")
+                    if self._start_watcher_cb:
+                        self._start_watcher_cb()
+                    return
+
+            conn_mode = cfg.get("conn_mode", "web")
+            if conn_mode == "api":
+                passkey = cfg.get("lacale_passkey", "")
+                if not lc.login_api(passkey):
+                    self.log("Abandon — vérifiez le passkey API.", "err"); return
+                lc.prepare_api()
+            else:
+                passkey = ""
+                if not lc.login(cfg["lacale_user"], cfg["lacale_pass"]):
+                    self.log("Abandon.", "err"); return
+                lc.prepare()
 
         self.log("  Vérification de la configuration en cours...", "muted")
 
@@ -1215,8 +1941,15 @@ class Worker:
                 self.log("  Vérifiez que le partage réseau est accessible.", "muted")
             else:
                 self.log("  Détection des films en cours... (1 min pour ~2000 fichiers)", "muted")
-                files = sorted(p for p in fp_root.rglob("*")
-                               if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
+                files = []
+                for p_ in fp_root.rglob("*"):
+                    if self._stop.is_set(): break
+                    if p_.is_file() and p_.suffix.lower() in VIDEO_EXTS:
+                        files.append(p_)
+                        if len(files) % 50 == 0:
+                            self.prog(-1, f"Scan films : {len(files)} fichiers...")
+                files.sort()
+                self.prog(0, "")
                 self.log(f"  {len(files)} fichier(s) trouvé(s).", "muted")
                 uploaded = 0
 
@@ -1265,48 +1998,122 @@ class Worker:
                     self.log(f"  Release : {release}", "muted")
 
                     if release in hist:
-                        self.log("  SKIP : release déjà uploadée.", "muted"); continue
+                        if qb.ok and qb.is_seeding_by_name(release):
+                            self.log("  SKIP : déjà uploadé et en seed.", "muted"); continue
+                        elif not qb.ok:
+                            self.log("  SKIP : release déjà uploadée.", "muted"); continue
+                        else:
+                            self.log("  Dans l'historique mais plus en seed — on réessaie.", "muted")
+                            # Supprimer l'ancien torrent en erreur dans QB si présent
+                            if qb.ok:
+                                old_hash = qb.find_error_torrent_by_name(release)
+                                if old_hash:
+                                    if qb.delete_torrent(old_hash, delete_files=False):
+                                        self.log(f"  QB : ancien torrent en erreur supprimé ({old_hash[:8]}...).", "muted")
+                                    else:
+                                        self.log("  QB : impossible de supprimer l'ancien torrent.", "muted")
 
-                    if lc.count(title) > 0:
+                    if lc is not None and lc.count(title) > 0:
                         self.log("  SKIP : déjà sur La Cale.", "muted"); continue
+                    # ── Vérification doublon Torr9 ────────────────────────────
+                    if use_torr9 and t9.check_duplicate(release):
+                        self.log("  SKIP : doublon détecté sur Torr9.", "muted"); continue
 
-                    # Torrent
+                    # ── Génération torrent ────────────────────────────────────
                     self.log("  Hash SHA1...", "muted")
                     self.prog(0.0, f"Hash : {fn[:50]}")
                     try:
-                        tb = make_torrent_single(fp, cfg["tracker_url"],
-                                                 lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"))
+                        tracker_url    = cfg.get("torr9_announce", "") if use_torr9 else cfg.get("tracker_url", "")
+                        torrent_source = "torr9" if use_torr9 else "lacale"
+                        tb = make_torrent_single(fp, tracker_url,
+                                                 lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"),
+                                                 source=torrent_source)
                     except Exception as e:
                         self.log(f"  ERREUR torrent : {e}", "err"); continue
                     self.prog(1.0, "")
                     self.log(f"  Torrent : {len(tb)//1024} Ko", "ok")
+                    # Sauvegarder uniquement dans le dossier de sortie
                     (out / f"{release}.torrent").write_bytes(tb)
 
+                    # ── NFO ───────────────────────────────────────────────────
                     sz  = fp.stat().st_size
-                    nfo = "\n".join([f"Complete name : {fn}",
-                                     f"File size     : {sz/1024**3:.2f} GiB",
-                                     f"Type          : Film",
-                                     f"Video         : {p['vc']} / {p['res'] or 'N/A'} / {p['hdr'] or 'SDR'}",
-                                     f"Audio         : {p['ac']} {p['ach']} {p['atmos']}",
-                                     f"Source        : {p['src']}",
-                                     f"Language      : {p['lang']}",
-                                     f"TMDb ID       : {tmdb_id or 'N/A'}",
-                                     f"IMDB ID       : {imdb_id or 'N/A'}",
-                                     f"Note TMDb     : {rating}/10",
-                                     f"Genres        : {genres or 'N/A'}"])
+                    nfo = make_nfo_film(fp, p, title, year, tmdb_id, imdb_id,
+                                        rating, genres, sz)
+                    self.log(f"  NFO : {'MediaInfo complet' if _MEDIAINFO_OK else 'fallback nom de fichier'}", "muted")
                     desc = make_bbcode(title, year, overview, poster, p["res"],
                                        p["vc"], p["ac"], p["lang"], sz, rating,
                                        genres, cast, p["hdr"], is_series=False)
 
-                    self._wait_if_checking(qb, self.log)
+                    # ── Chargement dans QB + mise en seed ─────────────────────
+                    if qb.ok:
+                        raw_path = cfg.get("qb_films_path", "/Films")
+                        self.log(f"  QB path config brut : '{raw_path}'", "muted")
+                        qb_films_root = _unc_to_linux(raw_path)
+                        self.log(f"  QB path converti    : '{qb_films_root}'", "muted")
+                        films_root    = Path(cfg.get("films_dir", ""))
+                        try:
+                            rel     = fp.parent.relative_to(films_root)
+                            rel_str = str(rel).replace("\\", "/")
+                            actual_save_path = qb_films_root if rel_str == "." else f"{qb_films_root}/{rel_str}"
+                        except ValueError:
+                            actual_save_path = qb_films_root
+                        if client_type == "transmission":
+                            actual_save_path = cfg.get("tr_films_path", "/Films")
+
+                        ih = torrent_info_hash(tb)
+                        self.log(f"  QB savepath → '{actual_save_path}'", "muted")
+                        self.log(f"  QB info-hash : {ih}", "muted")
+                        added = qb.add(tb, actual_save_path, release)
+                        if not added:
+                            self.log("  ERREUR : ajout dans qBittorrent échoué.", "err")
+                            self.log("  Arrêt du processus.", "err")
+                            self._stop.set(); break
+                        time.sleep(1)
+                        qb.set_location(ih, actual_save_path)
+
+                        # ── Vérification seed par hash ────────────────────────
+                        seed_ok = False
+                        for attempt in range(3):
+                            for i in range(10, 0, -1):
+                                if self._stop.is_set(): break
+                                self.prog(-1, f"Mise en seed : {attempt*10+10-i}s...")
+                                time.sleep(1)
+                            if self._stop.is_set(): break
+                            state, cp = qb.get_torrent_state_by_hash(ih)
+                            if state in ("uploading", "stalledUP", "forcedUP",
+                                         "queuedUP", "checkingUP", "stoppedUP",
+                                         "pausedUP", "moving"):
+                                seed_ok = True
+                                break
+                            elif state in ("missingFiles", "error"):
+                                self.log(f"  ERREUR seed : état '{state}'", "err")
+                                self.log(f"  QB cherche : {cp}", "err")
+                                self._stop.set(); break
+                            self.log(f"  [seed] état : {state or '?'} — attente...", "muted")
+                        self.prog(0, "")
+                        if self._stop.is_set(): break
+                        if not seed_ok:
+                            self.log("  ERREUR : seed non confirmé après 30s — arrêt.", "err")
+                            self._stop.set(); break
+                        self.log("  qBittorrent : seedé ✓", "ok")
+
+                    # ── Upload sur le tracker ─────────────────────────────────
                     self.log("  Upload...", "muted")
-                    terms    = lc.build_terms(p, is_series=False)
-                    if conn_mode == "api":
-                        ok, body = lc.upload_api(passkey, release, tb, nfo, desc,
-                                                  tmdb_id=tmdb_id, is_series=False, terms=terms)
+                    if use_torr9:
+                        ok, body = t9.upload(release, tb, desc,
+                                             is_series=False, tmdb_id=tmdb_id, nfo=nfo)
+                        link = f"https://torr9.net/torrents/{body.get('torrent_id','')}" if ok else ""
                     else:
-                        ok, body = lc.upload(release, tb, nfo, desc,
-                                             tmdb_id=tmdb_id, is_series=False, terms=terms)
+                        terms = lc.build_terms(p, is_series=False)
+                        if conn_mode == "api":
+                            ok, body = lc.upload_api(passkey, release, tb, nfo, desc,
+                                                      tmdb_id=tmdb_id, is_series=False, terms=terms)
+                        else:
+                            ok, body = lc.upload(release, tb, nfo, desc,
+                                                 tmdb_id=tmdb_id, is_series=False, terms=terms)
+                        slug = body.get("slug") or body.get("data", {}).get("slug", "")
+                        link = f"{cfg['lacale_url']}/torrents/{slug}" if slug else ""
+
                     if not ok:
                         msg = body.get("message") or body.get("error") or str(body)[:200]
                         self.log(f"  ERREUR : {msg}", "err")
@@ -1314,18 +2121,10 @@ class Worker:
                             self.log("  Limite atteinte — arrêt.", "err"); break
                         continue
 
-                    slug = body.get("slug") or body.get("data", {}).get("slug", "")
-                    link = f"{cfg['lacale_url']}/torrents/{slug}" if slug else ""
                     self.log(f"  OK !{' — '+link if link else ''}", "ok")
 
-                    if qb.ok:
-                        films_path = cfg.get("tr_films_path", "/Films") if client_type == "transmission" else cfg.get("qb_films_path", "/Films")
-                        added = qb.add(tb, films_path, release)
-                        self.log(f"  qBittorrent : {'seedé ✓' if added else 'ajout échoué'}",
-                                 "ok" if added else "muted")
-
                     self._notify_discord(cfg, title, year, release, link)
-                    self._save_history(hist, release, fn)
+                    self._save_history(hist, release, fn, cfg=cfg)
                     uploaded += 1; total += 1
                     self._set_count(total, grand_total)
                     if uploaded < max_films and not self._stop.is_set():
@@ -1348,7 +2147,9 @@ class Worker:
                 self.log("  Vérifiez que le partage réseau est accessible.", "muted")
             else:
                 self.log("  Détection des séries en cours... (1 min pour ~2000 fichiers)", "muted")
-                seasons = scan_seasons(sr)
+                seasons = scan_seasons(sr,
+                    prog_cb=lambda n: self.prog(-1, f"Scan séries : {n} saison(s)..."))
+                self.prog(0, "")
                 self.log(f"  {len(seasons)} saison(s) trouvée(s).", "muted")
                 uploaded = 0
 
@@ -1412,40 +2213,50 @@ class Worker:
                     self.log(f"  Release : {release}", "muted")
 
                     if release in hist:
-                        self.log("  SKIP : release déjà uploadée.", "muted"); continue
+                        if qb.ok and qb.is_seeding_by_name(release):
+                            self.log("  SKIP : déjà uploadé et en seed.", "muted"); continue
+                        elif not qb.ok:
+                            self.log("  SKIP : release déjà uploadée.", "muted"); continue
+                        else:
+                            self.log("  Dans l'historique mais plus en seed — on réessaie.", "muted")
+                            # Supprimer l'ancien torrent en erreur dans QB si présent
+                            if qb.ok:
+                                old_hash = qb.find_error_torrent_by_name(release)
+                                if old_hash:
+                                    if qb.delete_torrent(old_hash, delete_files=False):
+                                        self.log(f"  QB : ancien torrent en erreur supprimé ({old_hash[:8]}...).", "muted")
+                                    else:
+                                        self.log("  QB : impossible de supprimer l'ancien torrent.", "muted")
 
-                    if lc.count(title, is_series=True) > 0:
+                    if lc is not None and lc.count(title, is_series=True) > 0:
                         self.log(f"  SKIP : déjà sur La Cale.", "muted"); continue
 
-                    # Torrent multi-fichiers
+                    # ── Vérification doublon Torr9 ────────────────────────────
+                    if use_torr9 and t9.check_duplicate(release):
+                        self.log("  SKIP : doublon détecté sur Torr9.", "muted"); continue
+
+                    # ── Génération torrent ────────────────────────────────────
                     self.log(f"  Hash SHA1 ({len(sd['files'])} fichiers, {sd['total_size']/1024**3:.2f} GiB)...", "muted")
                     self.prog(0.0, f"Hash saison : {release[:50]}")
                     try:
+                        tracker_url    = cfg.get("torr9_announce", "") if use_torr9 else cfg.get("tracker_url", "")
+                        torrent_source = "torr9" if use_torr9 else "lacale"
                         tb = make_torrent_multi(
-                            release, sd["files"], cfg["tracker_url"],
-                            lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"))
+                            release, sd["files"], tracker_url,
+                            lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"),
+                            source=torrent_source)
                     except Exception as e:
                         self.log(f"  ERREUR torrent : {e}", "err"); continue
                     self.prog(1.0, "")
                     self.log(f"  Torrent : {len(tb)//1024} Ko", "ok")
+                    # Sauvegarder uniquement dans le dossier de sortie
                     (out / f"{release}.torrent").write_bytes(tb)
 
+                    # ── NFO ───────────────────────────────────────────────────
                     sz  = sd["total_size"]
-                    nfo = "\n".join([
-                        f"Series name   : {title}",
-                        f"Season        : {season_tag}",
-                        f"Episodes      : {len(sd['files'])}",
-                        f"Total size    : {sz/1024**3:.2f} GiB",
-                        f"Type          : Série",
-                        f"Video         : {p.get('vc','?')} / {p.get('res','N/A')} / {p.get('hdr','SDR')}",
-                        f"Audio         : {p.get('ac','?')} {p.get('ach','')} {p.get('atmos','')}",
-                        f"Source        : {p.get('src','WEB')}",
-                        f"Language      : {p.get('lang','FRENCH')}",
-                        f"TMDb ID       : {tmdb_id or 'N/A'}",
-                        f"Note TMDb     : {rating}/10",
-                        f"Genres        : {genres or 'N/A'}",
-                        f"",
-                        f"Episodes :"] + [f"  {f.name}" for f in sd["files"]])
+                    nfo = make_nfo_series(sd["files"], p, title, year, season_tag,
+                                          tmdb_id, rating, genres, sz)
+                    self.log(f"  NFO : {'MediaInfo complet' if _MEDIAINFO_OK else 'fallback nom de fichier'}", "muted")
 
                     desc = make_bbcode(title, f"{year} — {season_tag}", overview, poster,
                                        p.get("res", ""), p.get("vc", "x264"),
@@ -1453,15 +2264,75 @@ class Worker:
                                        sz, rating, genres, cast, p.get("hdr", ""),
                                        is_series=True, season_num=season_num)
 
-                    self._wait_if_checking(qb, self.log)
+                    # ── Chargement dans QB + mise en seed ─────────────────────
+                    if qb.ok:
+                        qb_series_root   = _unc_to_linux(cfg.get("qb_series_path", "/Series"))
+                        series_root_path = Path(cfg.get("series_dir", ""))
+                        try:
+                            season_dir_path  = sd["files"][0].parent
+                            show_dir         = season_dir_path.parent
+                            rel              = show_dir.relative_to(series_root_path)
+                            rel_str          = str(rel).replace("\\", "/")
+                            actual_save_path = f"{qb_series_root}/{rel_str}" if rel_str != "." else qb_series_root
+                        except (ValueError, IndexError):
+                            actual_save_path = qb_series_root
+                        if client_type == "transmission":
+                            actual_save_path = cfg.get("tr_series_path", "/Series")
+
+                        ih = torrent_info_hash(tb)
+                        self.log(f"  QB savepath → '{actual_save_path}'", "muted")
+                        self.log(f"  QB info-hash : {ih}", "muted")
+                        added = qb.add(tb, actual_save_path, release)
+                        if not added:
+                            self.log("  ERREUR : ajout dans qBittorrent échoué.", "err")
+                            self.log("  Arrêt du processus.", "err")
+                            self._stop.set(); break
+                        time.sleep(1)
+                        qb.set_location(ih, actual_save_path)
+
+                        # ── Vérification seed par hash ────────────────────────
+                        seed_ok = False
+                        for attempt in range(3):
+                            for i in range(10, 0, -1):
+                                if self._stop.is_set(): break
+                                self.prog(-1, f"Mise en seed : {attempt*10+10-i}s...")
+                                time.sleep(1)
+                            if self._stop.is_set(): break
+                            state, cp = qb.get_torrent_state_by_hash(ih)
+                            if state in ("uploading", "stalledUP", "forcedUP",
+                                         "queuedUP", "checkingUP", "stoppedUP",
+                                         "pausedUP", "moving"):
+                                seed_ok = True
+                                break
+                            elif state in ("missingFiles", "error"):
+                                self.log(f"  ERREUR seed : état '{state}'", "err")
+                                self.log(f"  QB cherche : {cp}", "err")
+                                self._stop.set(); break
+                            self.log(f"  [seed] état : {state or '?'} — attente...", "muted")
+                        self.prog(0, "")
+                        if self._stop.is_set(): break
+                        if not seed_ok:
+                            self.log("  ERREUR : seed non confirmé après 30s — arrêt.", "err")
+                            self._stop.set(); break
+                        self.log("  qBittorrent : seedé ✓", "ok")
+
+                    # ── Upload sur le tracker ─────────────────────────────────
                     self.log("  Upload...", "muted")
-                    terms    = lc.build_terms(p, is_series=True)
-                    if conn_mode == "api":
-                        ok, body = lc.upload_api(passkey, release, tb, nfo, desc,
-                                                  tmdb_id=tmdb_id, is_series=True, terms=terms)
+                    if use_torr9:
+                        ok, body = t9.upload(release, tb, desc,
+                                             is_series=True, tmdb_id=tmdb_id, nfo=nfo)
+                        link = f"https://torr9.net/torrents/{body.get('torrent_id','')}" if ok else ""
                     else:
-                        ok, body = lc.upload(release, tb, nfo, desc,
-                                             tmdb_id=tmdb_id, is_series=True, terms=terms)
+                        terms = lc.build_terms(p, is_series=True)
+                        if conn_mode == "api":
+                            ok, body = lc.upload_api(passkey, release, tb, nfo, desc,
+                                                      tmdb_id=tmdb_id, is_series=True, terms=terms)
+                        else:
+                            ok, body = lc.upload(release, tb, nfo, desc,
+                                                 tmdb_id=tmdb_id, is_series=True, terms=terms)
+                        slug = body.get("slug") or body.get("data", {}).get("slug", "")
+                        link = f"{cfg['lacale_url']}/torrents/{slug}" if slug else ""
+
                     if not ok:
                         msg = body.get("message") or body.get("error") or str(body)[:200]
                         self.log(f"  ERREUR : {msg}", "err")
@@ -1469,18 +2340,10 @@ class Worker:
                             self.log("  Limite atteinte — arrêt.", "err"); break
                         continue
 
-                    slug = body.get("slug") or body.get("data", {}).get("slug", "")
-                    link = f"{cfg['lacale_url']}/torrents/{slug}" if slug else ""
                     self.log(f"  OK !{' — '+link if link else ''}", "ok")
 
-                    if qb.ok:
-                        series_path = cfg.get("tr_series_path", "/Series") if client_type == "transmission" else cfg.get("qb_series_path", "/Series")
-                        added = qb.add(tb, series_path, release)
-                        self.log(f"  qBittorrent : {'seedé ✓' if added else 'ajout échoué'}",
-                                 "ok" if added else "muted")
-
                     self._notify_discord(cfg, f"{title} {season_tag}", year, release, link)
-                    self._save_history(hist, release, hist_key)
+                    self._save_history(hist, release, hist_key, cfg=cfg)
                     uploaded += 1; total += 1
                     if uploaded < max_series and not self._stop.is_set():
                         time.sleep(int(cfg.get("upload_delay", 3)))
@@ -1490,10 +2353,15 @@ class Worker:
         self.log(f"  TERMINÉ — {total} upload(s) effectué(s)", "gold")
         self.log(f"{'═'*60}", "gold")
 
-    def _save_history(self, hist_set, *keys):
+    def _save_history(self, hist_set, *keys, cfg=None):
+        # Lire le tracker depuis cfg passé en argument, ou self.cfg en fallback
+        _cfg     = cfg or self.cfg
+        tracker  = _cfg.get("active_tracker", "lacale")
+        tag      = "TORR9" if tracker == "torr9" else "LACALE"
+        date_str = __import__("datetime").date.today().strftime("%d/%m/%y")
         with open(HIST_FILE, "a", encoding="utf-8") as hf:
             for k in keys:
-                hf.write(k + "\n")
+                hf.write(f"{k}\t[{tag}]\t[DATE:{date_str}]\n")
         hist_set.update(keys)
 
     def _notify_discord(self, cfg, title, year, release, link):
@@ -1557,7 +2425,7 @@ T = {
         lbl_passkey="Passkey API :",
         lbl_passkey_hint="la-cale.space/settings/api-keys",
         sec_lacale="LA CALE",
-        sec_tmdb="THE MOVIE DATABASE (TMDb)",
+        sec_tmdb="THE MOVIE DATABASE (TMDb) & MediaInfo",
         sec_qb="QBITTORRENT",
         sec_misc="DIVERS",
         lbl_lacale_url="URL La Cale :",
@@ -1586,6 +2454,9 @@ T = {
         lbl_check_updates="Vérif. mises à jour :",
         check_updates_on="ACTIF",
         check_updates_off="NON ACTIF",
+        lbl_seed_check="Vérif. seed QB :",
+        seed_check_on="OBLIGATOIRE",
+        seed_check_off="DÉSACTIVÉE",
         lbl_update_available="Mise à jour disponible",
         lbl_save_curl="Génération fichiers curl Web :",
         save_logs_on="ACTIF",
@@ -1596,8 +2467,8 @@ T = {
         notify_off="NON ACTIF",
         lbl_notify_interval="Intervalle de vérification :",
         notify_hint="Activé auto si le site est KO",
-        tip_qb_url="ex: http://192.168.1.40:8080",
-        tip_qb_path="chemin Linux sur le NAS",
+        tip_qb_url="ex: http://192.168.1.x:8080",
+        tip_qb_path="Chemin d'accès aux fichiers, vu par Qbittorrent en local.\n(normalement même chemin que les deux premiers champs)\nConnexion pour Nas/Serveurs en cours de travail pour la prochaine release",
         btn_qb_fetch="↺ Récupérer",
         tmdb_link="Clé gratuite → themoviedb.org/settings/api",
         hist_title="Historique des uploads",
@@ -1654,7 +2525,7 @@ T = {
         lbl_passkey="API Passkey :",
         lbl_passkey_hint="la-cale.space/settings/api-keys",
         sec_lacale="LA CALE",
-        sec_tmdb="THE MOVIE DATABASE (TMDb)",
+        sec_tmdb="THE MOVIE DATABASE (TMDb) & MediaInfo",
         sec_qb="QBITTORRENT",
         sec_misc="MISC",
         lbl_lacale_url="La Cale URL :",
@@ -1683,6 +2554,9 @@ T = {
         lbl_check_updates="Check for updates :",
         check_updates_on="ACTIVE",
         check_updates_off="INACTIVE",
+        lbl_seed_check="QB seed check :",
+        seed_check_on="REQUIRED",
+        seed_check_off="DISABLED",
         lbl_update_available="Update available",
         lbl_save_curl="Web curl file generation :",
         save_logs_on="ACTIVE",
@@ -1693,7 +2567,7 @@ T = {
         notify_off="INACTIVE",
         lbl_notify_interval="Check interval :",
         notify_hint="Auto-enabled when site is down",
-        tip_qb_url="ex: http://192.168.1.40:8080",
+        tip_qb_url="ex: http://192.168.1.x:8080",
         tip_qb_path="Linux path on the NAS",
         btn_qb_fetch="↺ Fetch",
         tmdb_link="Free key → themoviedb.org/settings/api",
@@ -1751,7 +2625,7 @@ T = {
         lbl_passkey="Passkey API :",
         lbl_passkey_hint="la-cale.space/settings/api-keys",
         sec_lacale="LA CALE",
-        sec_tmdb="THE MOVIE DATABASE (TMDb)",
+        sec_tmdb="THE MOVIE DATABASE (TMDb) & MediaInfo",
         sec_qb="QBITTORRENT",
         sec_misc="MISC",
         lbl_lacale_url="URL La Cale :",
@@ -1790,7 +2664,7 @@ T = {
         notify_off="INACTIVO",
         lbl_notify_interval="Intervalo :",
         notify_hint="Activado auto si el sitio está caído",
-        tip_qb_url="ej: http://192.168.1.40:8080",
+        tip_qb_url="ej: http://192.168.1.x:8080",
         tip_qb_path="ruta Linux en el NAS",
         btn_qb_fetch="↺ Obtener",
         tmdb_link="Clave gratuita → themoviedb.org/settings/api",
@@ -1863,7 +2737,7 @@ _OVERRIDES = {
         status_done="  完了",
         status_stopping="  停止中...",
         sec_lacale="LA CALE",
-        sec_tmdb="THE MOVIE DATABASE (TMDb)",
+        sec_tmdb="THE MOVIE DATABASE (TMDb) & MediaInfo",
         sec_qb="QBITTORRENT",
         sec_misc="その他",
         lbl_lacale_url="La Cale URL :",
@@ -1886,7 +2760,7 @@ _OVERRIDES = {
         notify_off="無効",
         lbl_notify_interval="確認間隔 :",
         notify_hint="サイトがダウン時に自動有効",
-        tip_qb_url="例: http://192.168.1.40:8080",
+        tip_qb_url="例: http://192.168.1.x:8080",
         tip_qb_path="NAS上のLinuxパス",
         btn_qb_fetch="↺ 取得",
         tmdb_link="無料キー取得 → themoviedb.org/settings/api",
@@ -1995,10 +2869,11 @@ class SiteWatcher:
     puis s'arrête automatiquement.
     Se réactive automatiquement si le site retombe.
     """
-    def __init__(self, url: str, interval_min: int, on_back_callback):
+    def __init__(self, url: str, interval_min: int, on_back_callback, site_label: str = "La Cale"):
         self.url          = url.rstrip("/")
         self.interval     = interval_min * 60   # en secondes
         self.on_back      = on_back_callback    # appelé quand le site revient
+        self.site_label   = site_label
         self._stop_evt    = threading.Event()
         self._thread      = None
         self._active      = False
@@ -2046,7 +2921,7 @@ class SiteWatcher:
             if self._check_direct():
                 now = time.strftime("%Hh%M")
                 title   = f"Notification de vérification tierce à {now} :"
-                message = "La Cale de nouveau en ligne !"
+                message = f"{self.site_label} de nouveau en ligne !"
                 _windows_toast(title, message)
                 self._active = False
                 if self.on_back:
@@ -2138,9 +3013,11 @@ class App:
         # Watcher de surveillance du site
         self._notify_enabled = bool(self.cfg.get("notify_enabled", False))
         self._watcher: SiteWatcher | None = None
+        self._active_tracker = self.cfg.get("active_tracker", "lacale")
         self._save_logs_enabled = bool(self.cfg.get("save_logs", False))
         self._save_curl_enabled = bool(self.cfg.get("save_curl", False))
         self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
+        self._seed_check_enabled = bool(self.cfg.get("seed_check", True))
 
         # Fix combos invisibles sur Windows : forcer foreground sur les combobox
         # Le thème "clam" ne répercute pas correctement foreground en mode readonly
@@ -2187,6 +3064,7 @@ class App:
         self.root.rowconfigure(1, weight=1)   # log
         self.root.rowconfigure(2, weight=0)   # panneau fixe
         self.root.rowconfigure(3, weight=0)   # bottom bar
+
         self._build_logo()
         self._build_log()
         self._build_main()
@@ -2699,12 +3577,57 @@ class App:
         self.vars["ui_lang"].trace_add("write", self._on_ui_lang_change)
         r += 1
 
-        r = sec(r, "sec_lacale")
-        r = row(r, "lbl_lacale_url", "lacale_url", w=38)
+        # ── Section tracker : LA CALE ↔ TORR9 ───────────────────────────────
+        # En-tête avec les deux boutons tracker (remplace le simple sec_lacale)
+        tracker_hdr = tk.Frame(p, bg=C["bg"])
+        tracker_hdr.grid(row=r, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        self._btn_tracker_lacale = tk.Button(
+            tracker_hdr, text="LA CALE", font=FB,
+            bg=C["panel"], relief="flat", bd=0, padx=10, pady=3,
+            cursor="hand2", command=lambda: self._set_active_tracker("lacale"))
+        self._btn_tracker_lacale.pack(side="left")
+
+        self._btn_tracker_torr9 = tk.Button(
+            tracker_hdr, text="TORR9", font=FB,
+            bg=C["panel"], relief="flat", bd=0, padx=10, pady=3,
+            cursor="hand2", command=lambda: self._set_active_tracker("torr9"))
+        self._btn_tracker_torr9.pack(side="left", padx=(4, 0))
+
+        # Bouton "+" inactif — Pour la v2.0
+        btn_future = tk.Label(
+            tracker_hdr, text="  +  ", font=FB,
+            bg=C["panel"], fg=C["muted"],
+            relief="flat", bd=0, padx=10, pady=3,
+            cursor="arrow",
+            highlightthickness=0)
+        btn_future.pack(side="left", padx=(4, 0))
+        self._add_tooltip(btn_future, "Pour la v2.0")
+
+        tk.Frame(p, bg=C["gold_dim"], height=1).grid(
+            row=r, column=0, columnspan=4, sticky="ew", pady=(0, 3))
+        r += 1
+
+        # ── Champs LA CALE ────────────────────────────────────────────────
+        self._lacale_rows = []
+
+        lbl_lcurl = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
+                             anchor="w", width=24)
+        lbl_lcurl.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+        self._s_labels["row_lbl_lacale_url"] = (lbl_lcurl, "lbl_lacale_url")
+        self.vars["lacale_url"] = tk.StringVar()
+        lc_url_entry = tk.Entry(p, textvariable=self.vars["lacale_url"], font=FM,
+                                bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                                relief="flat", bd=0, highlightthickness=1,
+                                highlightbackground=C["border"], width=38)
+        lc_url_entry.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+        self._lacale_rows.extend([lbl_lcurl, lc_url_entry])
+        r += 1
 
         # ── Frame API (passkey) ───────────────────────────────────────────
         self._frame_api = tk.Frame(p, bg=C["bg"])
         self._frame_api.grid(row=r, column=0, columnspan=4, sticky="ew")
+        self._lacale_rows.append(self._frame_api)
 
         lbl_pk = tk.Label(self._frame_api, text="", font=FL, bg=C["bg"],
                           fg=C["muted"], anchor="w", width=24)
@@ -2725,9 +3648,10 @@ class App:
         self._s_labels["lbl_passkey_hint_lbl"] = (pk_link, "lbl_passkey_hint")
         r += 1
 
-        # ── Frame Web (email + pass) ──────────────────────────────────────
+        # ── Frame Web (email + pass La Cale) ──────────────────────────────
         self._frame_web = tk.Frame(p, bg=C["bg"])
         self._frame_web.grid(row=r, column=0, columnspan=4, sticky="ew")
+        self._lacale_rows.append(self._frame_web)
 
         lbl_em = tk.Label(self._frame_web, text="", font=FL, bg=C["bg"],
                           fg=C["muted"], anchor="w", width=24)
@@ -2752,10 +3676,74 @@ class App:
                  ).grid(row=1, column=1, sticky="w", padx=4, pady=1)
         r += 1
 
-        r = row(r, "lbl_tracker", "tracker_url", w=52)
+        lbl_tr = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
+                          anchor="w", width=24)
+        lbl_tr.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+        self._s_labels["row_lbl_tracker"] = (lbl_tr, "lbl_tracker")
+        self.vars["tracker_url"] = tk.StringVar()
+        lc_tr_entry = tk.Entry(p, textvariable=self.vars["tracker_url"], font=FM,
+                               bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                               relief="flat", bd=0, highlightthickness=1,
+                               highlightbackground=C["border"], width=52)
+        lc_tr_entry.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+        self._lacale_rows.extend([lbl_tr, lc_tr_entry])
+        r += 1
 
         # Appliquer la visibilité initiale selon le mode courant
         p.after(10, self._update_conn_btn)
+
+        # ── Champs TORR9 ──────────────────────────────────────────────────
+        self._torr9_rows = []
+
+        def torr9_row(r, label_txt, cfg_key, show=None, w=36, placeholder=None):
+            lbl = tk.Label(p, text=label_txt, font=FL, bg=C["bg"],
+                           fg=C["muted"], anchor="w", width=24)
+            lbl.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+            var = tk.StringVar(); self.vars[cfg_key] = var
+            e = tk.Entry(p, textvariable=var, font=FM, show=show or "",
+                         bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                         relief="flat", bd=0, highlightthickness=1,
+                         highlightbackground=C["border"], width=w)
+            e.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+            if placeholder:
+                def _update_color(*_):
+                    e.config(fg=C["muted"] if var.get() == placeholder else C["ifg"])
+                var.trace_add("write", _update_color)
+                _update_color()
+            self._torr9_rows.extend([lbl, e])
+            return r + 1
+
+        r = torr9_row(r, "Torr9 URL :",    "torr9_url",  w=38,
+                      placeholder="https://torr9.net/upload")
+        r = torr9_row(r, "Pseudonyme :",   "torr9_user", w=30)
+        r = torr9_row(r, "Mot de passe :", "torr9_pass", show="*", w=24)
+
+        # ── Champ URL de publication + bouton Récupérer ───────────────────────
+        lbl_ann = tk.Label(p, text="URL de publication :", font=FL, bg=C["bg"],
+                           fg=C["muted"], anchor="w", width=24)
+        lbl_ann.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+        self.vars["torr9_announce"] = tk.StringVar(
+            value="https://tracker.torr9.net/announce/****A CHANGER****")
+        ann_entry = tk.Entry(p, textvariable=self.vars["torr9_announce"],
+                             font=FM, bg=C["ibg"], fg=C["ifg"],
+                             insertbackground=C["gold"],
+                             relief="flat", bd=0, highlightthickness=1,
+                             highlightbackground=C["border"], width=36)
+        ann_entry.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+
+        self._btn_torr9_fetch = tk.Button(
+            p, text="↺ Récupérer", font=FM8,
+            bg=C["panel"], fg=C["gold_dim"],
+            relief="flat", bd=0, padx=6, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["border"],
+            command=self._fetch_torr9_announce)
+        self._btn_torr9_fetch.grid(row=r, column=2, sticky="w", padx=(0, 4), pady=1)
+
+        self._torr9_rows.extend([lbl_ann, ann_entry, self._btn_torr9_fetch])
+        r += 1
+
+        # Appliquer la visibilité tracker initiale
+        p.after(12, self._update_tracker_fields)
 
         r = sec(r, "sec_tmdb")
         r = link(r, "tmdb_link", "https://www.themoviedb.org/settings/api")
@@ -2772,6 +3760,122 @@ class App:
             ["fr-FR","en-US","de-DE","es-ES","it-IT","pt-PT"], width=10
         ).grid(row=r, column=1, sticky="w", padx=4)
         r += 1
+
+        # ── Lien Windows MediaInfo.dll ────────────────────────────────────────
+        lbl_mi_link = tk.Label(
+            p, text="WINDOWS: Fichier MediaInfo.dll → mediaarea.net/en/MediaInfo/Download/Windows",
+            font=("Courier New", 8, "underline"),
+            bg=C["bg"], fg=C["gold_dim"], cursor="hand2", anchor="w")
+        lbl_mi_link.grid(row=r, column=0, columnspan=4, sticky="w", padx=8)
+        lbl_mi_link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
+            "https://mediaarea.net/en/MediaInfo/Download/Windows"))
+        r += 1
+
+        # ── Champ MediaInfo.dll (Windows) ────────────────────────────────────
+        def _make_mi_row(row, label_txt, cfg_key, default_name, browse_title, filetypes):
+            lbl = tk.Label(p, text=label_txt, font=FL,
+                           bg=C["bg"], fg=C["muted"], anchor="w", width=24)
+            lbl.grid(row=row, column=0, sticky="w", padx=(8, 0), pady=1)
+
+            fr = tk.Frame(p, bg=C["bg"])
+            fr.grid(row=row, column=1, columnspan=3, sticky="ew", padx=4, pady=1)
+            fr.columnconfigure(0, weight=1)  # entry s'étire
+
+            default_val = str(APP_DIR / default_name)
+            var = tk.StringVar(value=default_val)
+            self.vars[cfg_key] = var
+
+            entry = tk.Entry(fr, textvariable=var, font=FM,
+                             bg=C["ibg"], fg=C["muted"],
+                             insertbackground=C["gold"], relief="flat", bd=0,
+                             highlightthickness=1, highlightbackground=C["border"])
+            entry.grid(row=0, column=0, sticky="ew", padx=(0, 2))
+
+            def _update_color(*_):
+                from pathlib import Path as _P
+                entry.config(fg=C["muted"] if var.get() == default_val else C["ifg"])
+            var.trace_add("write", _update_color)
+
+            def _check(sl_ref=[], v=var):
+                from pathlib import Path as _P
+                sl = sl_ref[0] if sl_ref else None
+                if sl is None: return
+                if _P(v.get().strip()).exists():
+                    sl.config(text="● Chargé", fg=C["green"])
+                else:
+                    sl.config(text="● Manquant", fg=C["red"])
+
+            def _browse(v=var, c=_check):
+                from tkinter import filedialog
+                path = filedialog.askopenfilename(
+                    title=browse_title, filetypes=filetypes,
+                    initialdir=str(APP_DIR))
+                if path:
+                    v.set(path); c()
+
+            tk.Button(fr, text="…", font=FM8, bg=C["panel"], fg=C["gold_dim"],
+                      relief="flat", bd=0, padx=5, cursor="hand2",
+                      highlightthickness=1, highlightbackground=C["border"],
+                      command=_browse
+                      ).grid(row=0, column=1, padx=(0, 2), sticky="w")
+
+            status_lbl = tk.Label(fr, text="", font=FM8, bg=C["bg"], width=9, anchor="w")
+            status_lbl.grid(row=0, column=2, sticky="w", padx=(0, 2))
+
+            # Patch _check pour accéder au status_lbl après création
+            _sl_ref = [status_lbl]
+            def _check_real(sl=status_lbl, v=var):
+                from pathlib import Path as _P
+                if _P(v.get().strip()).exists():
+                    sl.config(text="● Chargé",   fg=C["green"])
+                else:
+                    sl.config(text="● Manquant", fg=C["red"])
+
+            tk.Button(fr, text="↺", font=FM8, bg=C["panel"], fg=C["gold_dim"],
+                      relief="flat", bd=0, padx=5, pady=2, cursor="hand2",
+                      highlightthickness=1, highlightbackground=C["border"],
+                      command=_check_real
+                      ).grid(row=0, column=3, sticky="w", padx=(0, 0))
+
+            p.after(200, _check_real)
+            return row + 1
+
+        r = _make_mi_row(r,
+            "Fichier MediaInfo.dll :", "mediainfo_dll", "MediaInfo.dll",
+            "Sélectionner MediaInfo.dll",
+            [("DLL", "*.dll"), ("Tous", "*.*")])
+
+        # ── Lien macOS libmediainfo.dylib ─────────────────────────────────────
+        lbl_dylib_link = tk.Label(
+            p, text="macOS: Fichier libmediainfo.dylib → mediaarea.net/en/MediaInfo/Download/Mac_OS",
+            font=("Courier New", 8, "underline"),
+            bg=C["bg"], fg=C["gold_dim"], cursor="hand2", anchor="w")
+        lbl_dylib_link.grid(row=r, column=0, columnspan=4, sticky="w", padx=8)
+        lbl_dylib_link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
+            "https://mediaarea.net/en/MediaInfo/Download/Mac_OS"))
+        r += 1
+
+        # ── Champ libmediainfo.dylib (macOS) ──────────────────────────────────
+        r = _make_mi_row(r,
+            "Fichier .dylib :", "mediainfo_dylib", "libmediainfo.dylib",
+            "Sélectionner libmediainfo.dylib",
+            [("dylib", "*.dylib"), ("Tous", "*.*")])
+
+        # ── Lien Linux libmediainfo.so ────────────────────────────────────────
+        lbl_so_link = tk.Label(
+            p, text="Linux: Fichier libmediainfo.so → mediaarea.net/en/MediaInfo/Download/Ubuntu",
+            font=("Courier New", 8, "underline"),
+            bg=C["bg"], fg=C["gold_dim"], cursor="hand2", anchor="w")
+        lbl_so_link.grid(row=r, column=0, columnspan=4, sticky="w", padx=8)
+        lbl_so_link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
+            "https://mediaarea.net/en/MediaInfo/Download/Ubuntu"))
+        r += 1
+
+        # ── Champ libmediainfo.so (Linux) ─────────────────────────────────────
+        r = _make_mi_row(r,
+            "Fichier .so :", "mediainfo_so", "libmediainfo.so",
+            "Sélectionner libmediainfo.so",
+            [("so", "*.so*"), ("Tous", "*.*")])
 
         # ── Toggle QB / Transmission ──────────────────────────────────────
         # Ligne de titre avec les deux boutons côte à côte
@@ -2981,6 +4085,7 @@ class App:
         self._s_labels["row_lbl_check_updates"] = (lbl_cu, "lbl_check_updates")
 
         self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
+        self._seed_check_enabled = bool(self.cfg.get("seed_check", True))
         cu_frame = tk.Frame(p, bg=C["bg"])
         cu_frame.grid(row=r, column=1, columnspan=3, sticky="w", pady=(6, 2))
 
@@ -3154,6 +4259,7 @@ class App:
         self._refresh_notify_ui()
         self._refresh_logs_curl_ui()
         self._refresh_check_updates_ui()
+        self._refresh_seed_check_ui()
         # Étiquette MAJ
         if hasattr(self, "_lbl_update") and self._lbl_update.winfo_ismapped():
             self._lbl_update.config(text=f"  ↑ {t('lbl_update_available')}")
@@ -3183,88 +4289,290 @@ class App:
     # FENÊTRE HISTORIQUE
     # ══════════════════════════════════════════════════════════════════════════
     def _show_history(self):
+        if hasattr(self, "_history_win") and self._history_win and \
+                self._history_win.winfo_exists():
+            self._history_win.destroy()
+            self._history_win = None
+            return
+
+        from tkinter import ttk
+
         win = tk.Toplevel(self.root)
+        self._history_win = win
         win.title(t("hist_title"))
         win.configure(bg=C["bg"])
-        win.geometry("720x500")
+        win.geometry("530x560")
         win.resizable(True, True)
         win.transient(self.root)
+        win.bind("<Destroy>", lambda e: setattr(self, "_history_win", None))
 
-        # Header
+        # Layout grid sur win
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(2, weight=1)  # treeview seul s'agrandit
+
+        # ── Style ─────────────────────────────────────────────────────────────
+        style = ttk.Style()
+        style.configure("History.Treeview",
+                        background=C["ibg"], foreground=C["text"],
+                        fieldbackground=C["ibg"], borderwidth=0,
+                        rowheight=22, font=FM8)
+        style.configure("History.Treeview.Heading",
+                        background=C["panel"], foreground=C["muted"],
+                        borderwidth=0, relief="flat", font=FM8)
+        style.map("History.Treeview",
+                  background=[("selected", C["border"])],
+                  foreground=[("selected", C["gold"])])
+        style.map("History.Treeview.Heading",
+                  background=[("active", C["border"])])
+        style.layout("History.Treeview",
+                     [("History.Treeview.treearea", {"sticky": "nswe"})])
+
+        # ── Row 0 : header ────────────────────────────────────────────────────
         hf = tk.Frame(win, bg=C["bg"])
-        hf.pack(fill="x", padx=14, pady=(10, 0))
+        hf.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 0))
         tk.Label(hf, text=t("hist_title"), font=FB,
                  bg=C["bg"], fg=C["gold"]).pack(side="left")
-        tk.Frame(win, bg=C["gold_dim"], height=1).pack(
-            fill="x", padx=14, pady=(4, 0))
 
-        # Zone texte scrollable avec SlimScrollbar
-        hist_frame = tk.Frame(win, bg=C["bg"])
-        hist_frame.pack(fill="both", expand=True, padx=14, pady=8)
-        hist_frame.columnconfigure(0, weight=1)
-        hist_frame.rowconfigure(0, weight=1)
+        # ── Row 1 : séparateur ────────────────────────────────────────────────
+        tk.Frame(win, bg=C["gold_dim"], height=1).grid(
+            row=1, column=0, sticky="ew", padx=14, pady=(4, 0))
 
-        txt = tk.Text(
-            hist_frame, bg=C["ibg"], fg=C["text"], font=FM8,
-            relief="flat", bd=0,
-            highlightthickness=1, highlightbackground=C["border"],
-            wrap="none", state="normal")
-        txt.grid(row=0, column=0, sticky="nsew")
-        _hist_vsb = SlimScrollbar(hist_frame, command=txt.yview)
-        _hist_vsb.grid(row=0, column=1, sticky="ns")
-        txt.configure(yscrollcommand=_hist_vsb.set)
+        # ── Row 2 : treeview ──────────────────────────────────────────────────
+        tv_frame = tk.Frame(win, bg=C["bg"])
+        tv_frame.grid(row=2, column=0, sticky="nsew", padx=14, pady=(4, 0))
+        tv_frame.columnconfigure(0, weight=1)
+        tv_frame.rowconfigure(0, weight=1)
 
-        if HIST_FILE.exists():
-            lines = HIST_FILE.read_text("utf-8", errors="ignore").splitlines()
-            # Filtrer : une ligne sur deux est le nom de fichier, l'autre le release name
-            # On affiche tout, avec un séparateur visuel tous les 2
-            entries = []
-            i = 0
-            while i < len(lines):
-                l = lines[i].strip()
-                if l:
-                    entries.append(l)
-                i += 1
-            if entries:
-                for idx, entry in enumerate(entries, 1):
-                    txt.insert("end", f"  {idx:>4}.  {entry}\n")
-            else:
-                txt.insert("end", f"\n  {t('hist_empty')}\n")
-        else:
-            txt.insert("end", f"\n  {t('hist_empty')}\n")
+        COLS = ("#", "Titre", "Date d'upload", "ÉTAT", "Tracker", " ")
+        COL_WIDTHS = {"#": 40, "Titre": 340, "Date d'upload": 90,
+                      "ÉTAT": 80, "Tracker": 70, " ": 24}
+        col_visible = {"Date d'upload": [True], "ÉTAT": [True], "Tracker": [True]}
 
-        txt.config(state="disabled")
+        tv = ttk.Treeview(tv_frame, style="History.Treeview",
+                          columns=COLS, show="headings", selectmode="browse")
+        tv.grid(row=0, column=0, sticky="nsew")
+        vsb = SlimScrollbar(tv_frame, command=tv.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        tv.configure(yscrollcommand=vsb.set)
+        tv.bind("<MouseWheel>", lambda e: tv.yview_scroll(int(-1*(e.delta/120)), "units"))
 
-        # Boutons
+        tv.tag_configure("seeding", foreground=C["green"],  background=C["ibg"])
+        tv.tag_configure("error",   foreground=C["red"],    background=C["ibg"])
+        tv.tag_configure("deleted", foreground="#9ca3af",   background=C["ibg"])
+        tv.tag_configure("odd",     background="#161616",   foreground=C["text"])
+        tv.tag_configure("even",    background=C["ibg"],    foreground=C["text"])
+
+        # ── Row 3 : barre bas ─────────────────────────────────────────────────
         bf = tk.Frame(win, bg=C["bg"])
-        bf.pack(fill="x", padx=14, pady=(0, 10))
+        bf.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 10))
 
+        sort_col = ["#"]
+        sort_asc = [True]
+        entries_cache = []
+
+        def parse_lines():
+            if not HIST_FILE.exists():
+                return []
+            entries = []
+            for raw in HIST_FILE.read_text("utf-8", errors="ignore").splitlines():
+                raw = raw.strip()
+                if not raw: continue
+                parts       = raw.split("\t")
+                title       = parts[0].strip()
+                tracker_key = ""
+                date_val    = ""
+                for part in parts[1:]:
+                    p = part.strip().strip("[]")
+                    if p in ("TORR9", "LACALE"):
+                        tracker_key = p
+                    elif p.startswith("DATE:"):
+                        date_val = p[5:]
+                entries.append({"title": title, "tracker": tracker_key, "date": date_val})
+            return entries
+
+        def get_seed_state(title):
+            try:
+                cfg_local   = self.cfg
+                if cfg_local.get("torrent_client", "qbittorrent") == "transmission":
+                    return ""
+                url  = cfg_local.get("qb_url", "").strip()
+                user = cfg_local.get("qb_user", "").strip()
+                pwd  = cfg_local.get("qb_pass", "").strip()
+                if not url: return ""
+                import requests as _req
+                sess = _req.Session()
+                r = sess.post(f"{url.rstrip('/')}/api/v2/auth/login",
+                              data={"username": user, "password": pwd}, timeout=5)
+                if r.status_code != 200 or "ok" not in r.text.lower(): return ""
+                r2 = sess.get(f"{url.rstrip('/')}/api/v2/torrents/info",
+                              params={"filter": "all"}, timeout=10)
+                if r2.status_code != 200: return ""
+                GOOD = {"uploading","stalledUP","forcedUP","queuedUP",
+                        "checkingUP","stoppedUP","pausedUP","moving"}
+                name_low = title.lower()
+                for t2 in r2.json():
+                    t_name = (t2.get("name") or "").lower()
+                    if name_low in t_name or t_name in name_low:
+                        st = t2.get("state", "")
+                        if st in GOOD: return "seeding"
+                        if st in ("missingFiles","error"): return "error"
+                        return ""
+            except Exception:
+                pass
+            return "deleted"
+
+        def build_columns():
+            visible = ["#", "Titre"] + [
+                c for c in ("Date d'upload", "ÉTAT", "Tracker")
+                if col_visible[c][0]] + [" "]
+            tv.configure(displaycolumns=visible)
+            for col in visible:
+                arrow = (" ▲" if sort_asc[0] else " ▼") if col == sort_col[0] else ""
+                tv.heading(col, text=col+arrow, command=lambda c=col: _sort_by(c))
+                anchor = "e" if col == "#" else "w" if col == "Titre" else "center"
+                tv.column(col, width=COL_WIDTHS.get(col, 80),
+                          stretch=(col == "Titre"),
+                          anchor=anchor)
+            tv.column(" ", width=24, stretch=False, anchor="center")
+
+        def _sort_by(col):
+            if col == " ": return
+            sort_asc[0] = not sort_asc[0] if sort_col[0]==col else True
+            sort_col[0] = col
+            build_columns(); _populate()
+
+        def _populate():
+            tv.delete(*tv.get_children())
+            entries_cache.clear()
+            entries = parse_lines()
+            # Debug : afficher le chemin et nb entrées dans le titre de la fenêtre
+            win.title(f"{t('hist_title')} — {HIST_FILE} ({len(entries)} entrées)")
+            if not entries: return
+            col = sort_col[0]
+            key_fn = {"Titre": lambda e: e["title"].lower(),
+                      "Date d'upload": lambda e: e["date"],
+                      "Tracker": lambda e: e["tracker"]}.get(col)
+            sorted_entries = sorted(entries, key=key_fn, reverse=not sort_asc[0]) \
+                             if key_fn else (entries if sort_asc[0] else list(reversed(entries)))
+            for idx, entry in enumerate(sorted_entries):
+                tracker_key = entry["tracker"]
+                tk_disp = {"TORR9": "🔵 Torr9", "LACALE": "🟡 La Cale"}.get(
+                            tracker_key, tracker_key or "?")
+                row_bg = "odd" if idx % 2 else "even"
+                tv.insert("", "end", iid=str(idx), tags=(row_bg,),
+                    values=(f"{idx+1:>4}", entry["title"],
+                            entry["date"] if col_visible["Date d'upload"][0] else "",
+                            "…" if col_visible["ÉTAT"][0] else "",
+                            tk_disp if col_visible["Tracker"][0] else "",
+                            "🗑"))
+                entries_cache.append(entry)
+                if col_visible["ÉTAT"][0]:
+                    def _fetch(i=idx, tit=entry["title"], tg=row_bg):
+                        def _bg():
+                            s = get_seed_state(tit)
+                            disp = {"seeding": "🟢 seed", "error": "🔴 error",
+                                    "deleted": "⚫ absent", "": "?"}.get(s, "?")
+                            tag  = {"seeding": "seeding", "error": "error",
+                                    "deleted": "deleted"}.get(s, tg)
+                            def _up():
+                                if str(i) not in tv.get_children(): return
+                                v = list(tv.item(str(i), "values"))
+                                v[3] = disp
+                                tv.item(str(i), values=v, tags=(tag,))
+                            try: tv.after(0, _up)
+                            except Exception: pass
+                        threading.Thread(target=_bg, daemon=True).start()
+                    _fetch()
+
+        def _on_click(e):
+            col_id = tv.identify_column(e.x)
+            row_id = tv.identify_row(e.y)
+            if not row_id or col_id != f"#{len(tv['displaycolumns'])}": return
+            idx = int(row_id)
+            if idx >= len(entries_cache): return
+            entry = entries_cache[idx]
+            dlg = tk.Toplevel(win)
+            dlg.title("Confirmer"); dlg.configure(bg=C["bg"])
+            dlg.resizable(False, False); dlg.transient(win)
+            fr = tk.Frame(dlg, bg=C["bg"]); fr.pack(padx=20, pady=14)
+            tk.Label(fr, text=f"Supprimer '{entry['title'][:60]}' ?",
+                     font=FM8, bg=C["bg"], fg=C["text"], wraplength=380).pack(pady=(0,10))
+            def _confirm():
+                dlg.destroy()
+                ls = [l for l in HIST_FILE.read_text("utf-8", errors="ignore").splitlines()
+                      if entry["title"] not in l]
+                HIST_FILE.write_text("\n".join(ls), "utf-8"); _populate()
+            tk.Button(fr, text="Supprimer 🗑", command=_confirm, font=FB,
+                      bg=C["panel"], fg=C["red"], relief="flat", bd=0,
+                      padx=14, pady=5, cursor="hand2",
+                      highlightthickness=1, highlightbackground=C["red"]
+                      ).pack(side="left", padx=(0,10))
+            tk.Button(fr, text="Annuler", command=dlg.destroy, font=FB,
+                      bg=C["panel"], fg=C["gold"], relief="flat", bd=0,
+                      padx=14, pady=5, cursor="hand2",
+                      highlightthickness=1, highlightbackground=C["gold"]
+                      ).pack(side="left")
+            dlg.focus_set()
+
+        tv.bind("<ButtonRelease-1>", _on_click)
+
+        # Boutons barre bas
         def clear_hist():
-            if messagebox.askyesno(t("hist_btn_clear"),
-                                   t("hist_confirm_clear"),
-                                   parent=win):
-                HIST_FILE.write_text("", "utf-8")
-                txt.config(state="normal")
-                txt.delete("1.0", "end")
-                txt.insert("end", f"\n  {t('hist_empty')}\n")
-                txt.config(state="disabled")
+            dlg = tk.Toplevel(win)
+            dlg.title(t("hist_btn_clear")); dlg.configure(bg=C["bg"])
+            dlg.resizable(False, False); dlg.transient(win)
+            fr = tk.Frame(dlg, bg=C["bg"]); fr.pack(padx=20, pady=14)
+            tk.Label(fr, text=t("hist_confirm_clear"),
+                     font=FM8, bg=C["bg"], fg=C["text"]).pack(pady=(0,10))
+            def _confirm():
+                dlg.destroy()
+                HIST_FILE.write_text("", "utf-8"); _populate()
+            tk.Button(fr, text="Vider 🗑", command=_confirm, font=FB,
+                      bg=C["panel"], fg=C["red"], relief="flat", bd=0,
+                      padx=14, pady=5, cursor="hand2",
+                      highlightthickness=1, highlightbackground=C["red"]
+                      ).pack(side="left", padx=(0,10))
+            tk.Button(fr, text="Annuler", command=dlg.destroy, font=FB,
+                      bg=C["panel"], fg=C["gold"], relief="flat", bd=0,
+                      padx=14, pady=5, cursor="hand2",
+                      highlightthickness=1, highlightbackground=C["gold"]
+                      ).pack(side="left")
+            dlg.focus_set()
 
         tk.Button(bf, text=t("hist_btn_clear"), command=clear_hist,
-                  font=FM8, bg=C["panel"], fg=C["muted"],
-                  relief="flat", bd=0, padx=8, pady=4, cursor="hand2",
+                  font=FM8, bg=C["panel"], fg=C["muted"], relief="flat", bd=0,
+                  padx=8, pady=4, cursor="hand2",
                   highlightthickness=1, highlightbackground=C["border"]
                   ).pack(side="left")
-        tk.Button(bf, text=t("hist_btn_close"), command=win.destroy,
-                  font=FB, bg=C["panel"], fg=C["gold"],
-                  relief="flat", bd=0, padx=12, pady=4, cursor="hand2",
-                  highlightthickness=1, highlightbackground=C["gold"]
-                  ).pack(side="right")
 
+        tk.Button(bf, text=t("hist_btn_close"), command=win.destroy,
+                  font=FB, bg=C["panel"], fg=C["gold"], relief="flat", bd=0,
+                  padx=12, pady=4, cursor="hand2",
+                  highlightthickness=1, highlightbackground=C["gold"]
+                  ).pack(side="right", padx=(4, 0))
+
+        def _make_col_toggle(lbl, col_ref):
+            btn = tk.Button(bf, text=lbl, font=FM8, bg=C["panel"], fg=C["muted"],
+                            relief="flat", bd=0, padx=8, pady=4, cursor="hand2",
+                            highlightthickness=1, highlightbackground=C["muted"])
+            btn.pack(side="right", padx=(4, 0))
+            def _toggle():
+                col_ref[0] = not col_ref[0]
+                c = C["gold"] if col_ref[0] else C["muted"]
+                btn.config(fg=c, highlightbackground=c)
+                build_columns(); _populate()
+            btn.config(command=_toggle,
+                       fg=C["gold"] if col_ref[0] else C["muted"],
+                       highlightbackground=C["gold"] if col_ref[0] else C["muted"])
+
+        _make_col_toggle("Tracker",       col_visible["Tracker"])
+        _make_col_toggle("ÉTAT",          col_visible["ÉTAT"])
+        _make_col_toggle("Date d'upload", col_visible["Date d'upload"])
+
+        build_columns()
+        _populate()
         win.focus_set()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Grades
-    # ══════════════════════════════════════════════════════════════════════════
     def _on_grade_film(self, *_):
         try:
             idx = get_grades().index(self.grade_film_var.get())
@@ -3273,6 +4581,61 @@ class App:
 
     def _on_grade_series(self, *_):
         pass  # plus utilisé — max_series = max_movies
+
+    def _fetch_torr9_announce(self):
+        """Récupère l'URL d'annonce Torr9 depuis le passkey utilisateur."""
+        url  = self.vars.get("torr9_url",  tk.StringVar()).get().strip().rstrip("/")
+        user = self.vars.get("torr9_user", tk.StringVar()).get().strip()
+        pwd  = self.vars.get("torr9_pass", tk.StringVar()).get().strip()
+
+        if not url or not user or not pwd:
+            messagebox.showwarning("Torr9",
+                "Renseignez d'abord l'URL, le pseudonyme et le mot de passe Torr9.")
+            return
+
+        self._btn_torr9_fetch.config(state="disabled", text="...")
+
+        def _do():
+            result = None
+            error  = None
+            try:
+                import requests as _req
+                # Login
+                r = _req.post(f"https://api.torr9.net/api/v1/auth/login",
+                              json={"username": user, "password": pwd}, timeout=10)
+                body = r.json()
+                token = body.get("token", "")
+                if not token:
+                    error_msg = body.get("error", "Connexion échouée")
+                    raise Exception(error_msg)
+                # Récupérer le passkey depuis le profil utilisateur
+                passkey = body.get("user", {}).get("passkey", "")
+                if passkey:
+                    result = f"https://tracker.torr9.net/announce/{passkey}"
+                else:
+                    # Essayer via /api/v1/user/profile
+                    sess = _req.Session()
+                    sess.headers["Authorization"] = f"Bearer {token}"
+                    r2 = sess.get("https://api.torr9.net/api/v1/user/profile", timeout=10)
+                    passkey = r2.json().get("passkey", "")
+                    if passkey:
+                        result = f"https://tracker.torr9.net/announce/{passkey}"
+                    else:
+                        raise Exception("Passkey introuvable dans le profil.")
+            except Exception as e:
+                error = str(e)
+            self.root.after(0, lambda: self._on_torr9_fetch_done(result, error))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_torr9_fetch_done(self, result, error):
+        self._btn_torr9_fetch.config(state="normal", text="↺ Récupérer")
+        if error:
+            messagebox.showerror("Torr9", f"Erreur : {error}")
+            return
+        if result:
+            self.vars["torr9_announce"].set(result)
+            self._log(f"Torr9 → URL d'annonce récupérée.", "ok")
 
     def _fetch_qb_paths(self):
         """Interroge qBittorrent pour récupérer le save_path par défaut."""
@@ -3340,7 +4703,12 @@ class App:
         self._update_conn_btn()
         # Client torrent
         self._torrent_client = self.cfg.get("torrent_client", "qbittorrent")
+        # Tracker actif
+        self._active_tracker = self.cfg.get("active_tracker", "lacale")
         self.root.after(20, self._update_client_ui)
+        self.root.after(22, self._update_torr9_btn)
+        self.root.after(24, self._update_tracker_fields)
+        self.root.after(26, self._update_health_label)
         # Notification watcher
         self._notify_enabled = bool(self.cfg.get("notify_enabled", False))
         self.root.after(30, self._refresh_notify_ui)
@@ -3359,6 +4727,7 @@ class App:
 
         # Vérification MAJ au démarrage (en arrière-plan)
         self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
+        self._seed_check_enabled = bool(self.cfg.get("seed_check", True))
         self.root.after(2000, self._run_update_check)   # 2s après démarrage
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -3378,7 +4747,7 @@ class App:
         if not hasattr(self, "_btn_client_qb"):
             return
         is_qb = self._torrent_client == "qbittorrent"
-        # Boutons : actif = or, inactif = gris
+        # Boutons QB/TR : actif = or, inactif = gris
         self._btn_client_qb.config(
             fg=C["gold"] if is_qb else C["muted"],
             highlightthickness=1,
@@ -3387,17 +4756,85 @@ class App:
             fg=C["muted"] if is_qb else C["gold"],
             highlightthickness=1,
             highlightbackground=C["muted"] if is_qb else C["gold"])
-        # Afficher/masquer les champs
+        # Afficher/masquer les champs QB / TR
         for w in self._qb_rows:
             w.grid() if is_qb else w.grid_remove()
         for w in self._tr_rows:
             w.grid_remove() if is_qb else w.grid()
+
+    def _set_active_tracker(self, tracker):
+        """Bascule le tracker actif entre lacale et torr9."""
+        self._active_tracker = tracker
+        if tracker == "torr9":
+            # Torr9 = Web uniquement → forcer le mode Web
+            if self._conn_mode != "web":
+                self._conn_mode = "web"
+        cfg = self._collect()
+        cfg["active_tracker"] = self._active_tracker
+        save_cfg(cfg); self.cfg = cfg
+        self._update_torr9_btn()
+        self._update_conn_btn()
+        self._update_tracker_fields()
+        self._update_health_label()
+        self._log_active_config()
+
+    def _update_tracker_fields(self):
+        """Affiche les champs La Cale ou Torr9 selon le tracker actif."""
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        for w in getattr(self, "_lacale_rows", []):
+            w.grid_remove() if is_torr9 else w.grid()
+        # _frame_api / _frame_web sont gérés dans _update_conn_btn — on les force ici aussi
+        if hasattr(self, "_frame_api") and hasattr(self, "_frame_web"):
+            if is_torr9:
+                self._frame_api.grid_remove()
+                self._frame_web.grid_remove()
+            else:
+                if self._conn_mode == "api":
+                    self._frame_api.grid()
+                    self._frame_web.grid_remove()
+                else:
+                    self._frame_api.grid_remove()
+                    self._frame_web.grid()
+        for w in getattr(self, "_torr9_rows", []):
+            w.grid() if is_torr9 else w.grid_remove()
+
+    def _update_torr9_btn(self):
+        """Met à jour le visuel des boutons LA CALE et TORR9."""
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        if hasattr(self, "_btn_tracker_lacale"):
+            self._btn_tracker_lacale.config(
+                fg=C["muted"] if is_torr9 else C["gold"],
+                highlightthickness=1,
+                highlightbackground=C["muted"] if is_torr9 else C["gold"])
+        if hasattr(self, "_btn_tracker_torr9"):
+            self._btn_tracker_torr9.config(
+                fg=C["gold"] if is_torr9 else C["muted"],
+                highlightthickness=1,
+                highlightbackground=C["gold"] if is_torr9 else C["muted"])
+
+    def _update_health_label(self):
+        """Adapte le texte du label de santé selon le tracker actif."""
+        if not hasattr(self, "_health_var"):
+            return
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        # Mettre à jour le texte (garder la bille actuelle)
+        current = self._health_var.get()
+        # Extraire la bille (dernier caractère émoji)
+        bille = current.split()[-1] if current else "⚪"
+        if is_torr9:
+            self._health_var.set(f"Santé Torr9 : {bille}")
+        else:
+            self._health_var.set(f"Santé La Cale : {bille}")
 
     def _toggle_check_updates(self):
         self._check_updates_enabled = not self._check_updates_enabled
         cfg = self._collect(); cfg["check_updates"] = self._check_updates_enabled
         save_cfg(cfg); self.cfg = cfg
         self._refresh_check_updates_ui()
+        # Si on désactive, masquer immédiatement l'étiquette de mise à jour
+        if not self._check_updates_enabled:
+            if hasattr(self, "_lbl_update") and self._lbl_update.winfo_ismapped():
+                self._lbl_update.pack_forget()
 
     def _refresh_check_updates_ui(self):
         if not hasattr(self, "_btn_check_updates"):
@@ -3409,6 +4846,24 @@ class App:
         else:
             self._btn_check_updates.config(
                 text=t("check_updates_off"), fg=C["muted"],
+                highlightthickness=1, highlightbackground=C["muted"])
+
+    def _toggle_seed_check(self):
+        self._seed_check_enabled = not self._seed_check_enabled
+        cfg = self._collect(); cfg["seed_check"] = self._seed_check_enabled
+        save_cfg(cfg); self.cfg = cfg
+        self._refresh_seed_check_ui()
+
+    def _refresh_seed_check_ui(self):
+        if not hasattr(self, "_btn_seed_check"):
+            return
+        if self._seed_check_enabled:
+            self._btn_seed_check.config(
+                text=t("seed_check_on"), fg=C["gold"],
+                highlightthickness=1, highlightbackground=C["gold"])
+        else:
+            self._btn_seed_check.config(
+                text=t("seed_check_off"), fg=C["muted"],
                 highlightthickness=1, highlightbackground=C["muted"])
 
     def _run_update_check(self):
@@ -3424,6 +4879,9 @@ class App:
     def _show_update_badge(self, changelog=""):
         """Affiche l'étiquette verte 'Mise à jour disponible' avec tooltip."""
         if not hasattr(self, "_lbl_update"):
+            return
+        # Ne pas afficher si les vérifications de MAJ sont désactivées
+        if not self._check_updates_enabled:
             return
         self._lbl_update.config(text=f"  ↑ {t('lbl_update_available')}")
         self._lbl_update.pack(side="left", padx=(10, 0))
@@ -3500,7 +4958,9 @@ class App:
     # ══════════════════════════════════════════════════════════════════════════
     def _health_loop(self):
         """Lance une vérification en arrière-plan puis replanifie dans 10 min."""
-        self.root.after(0, lambda: self._health_var.set("Santé La Cale : ⚪"))
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        label = "Santé Torr9 : ⚪" if is_torr9 else "Santé La Cale : ⚪"
+        self.root.after(0, lambda: self._health_var.set(label))
         self.root.after(0, lambda: self._health_lbl.config(fg=C["muted"]))
         threading.Thread(target=self._do_health_check, daemon=True).start()
 
@@ -3515,7 +4975,14 @@ class App:
         Le voyant est 🟢 seulement si les deux passes sont OK.
         Si la passe 1 est ambiguë/indisponible, on se fie uniquement à la passe 2.
         """
-        url = self.cfg.get("lacale_url", "https://la-cale.space").rstrip("/")
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        if is_torr9:
+            url    = self.cfg.get("torr9_url", "https://www.torr9.net").rstrip("/")
+            domain = "torr9.net"
+        else:
+            url    = self.cfg.get("lacale_url", "https://la-cale.space").rstrip("/")
+            domain = "la-cale.space"
+
         ok  = False
         p1_failed = False   # True si la passe 1 dit explicitement "down"
 
@@ -3523,7 +4990,7 @@ class App:
         try:
             r1 = requests.get(
                 "https://www.isitdownrightnow.com/check.php",
-                params={"domain": "la-cale.space"},
+                params={"domain": domain},
                 timeout=8,
                 headers={"User-Agent":
                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -3556,11 +5023,14 @@ class App:
 
     def _update_health_indicator(self, ok: bool):
         """Met à jour la boule verte/rouge dans la barre du bas."""
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        label_ok  = "Santé Torr9 : 🟢"  if is_torr9 else "Santé La Cale : 🟢"
+        label_ko  = "Santé Torr9 : 🔴"  if is_torr9 else "Santé La Cale : 🔴"
         if ok:
-            self._health_var.set("Santé La Cale : 🟢")
+            self._health_var.set(label_ok)
             self._health_lbl.config(fg=C["green"])
         else:
-            self._health_var.set("Santé La Cale : 🔴")
+            self._health_var.set(label_ko)
             self._health_lbl.config(fg=C["red"])
             # Déclencher le watcher si la notification est activée
             if self._notify_enabled and (
@@ -3601,20 +5071,29 @@ class App:
         if self._watcher and self._watcher.active:
             self._watcher.stop()
 
-        url      = self.cfg.get("lacale_url", "https://la-cale.space")
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        if is_torr9:
+            url      = self.cfg.get("torr9_url", "https://www.torr9.net")
+            site_lbl = "Torr9"
+        else:
+            url      = self.cfg.get("lacale_url", "https://la-cale.space")
+            site_lbl = "La Cale"
         interval = int(self.cfg.get("notify_interval", "10") or "10")
 
-        self._watcher = SiteWatcher(url, interval, self._on_site_back)
+        self._watcher = SiteWatcher(url, interval, self._on_site_back, site_label=site_lbl)
         self._watcher.start()
         self._log(
-            f"  Surveillance de la santé du site par un watcher extérieur activée — vérification toutes les {interval} min.", "muted")
+            f"  Surveillance de la santé de {site_lbl} par un watcher extérieur activée"
+            f" — vérification toutes les {interval} min.", "muted")
 
     def _on_site_back(self):
         """Callback appelé par le watcher quand le site revient."""
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        site_lbl = "Torr9" if is_torr9 else "La Cale"
         now = time.strftime("%Hh%M")
         self.root.after(0, self._log,
-                        f"✓ Site de retour ({now}) — vous pouvez relancer l'upload.", "ok")
-        self.root.after(0, self.status.set, f"  Site revenu à {now} ✓")
+                        f"✓ {site_lbl} de retour ({now}) — vous pouvez relancer l'upload.", "ok")
+        self.root.after(0, self.status.set, f"  {site_lbl} revenu à {now} ✓")
         # Jouer le son ARR! (hors lecteur, une seule fois, en parallèle)
         threading.Thread(target=self._play_arr, daemon=True).start()
 
@@ -3678,27 +5157,90 @@ class App:
 
     def _update_conn_btn(self):
         """Met à jour le visuel du bouton toggle API/Web."""
-        if self._conn_mode == "api":
-            self.b_conn.config(
-                text=f"  {t('conn_api')}  ",
-                fg=C["green"], highlightthickness=1,
-                highlightbackground=C["green"])
-        else:
+        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
+        if is_torr9:
+            # Torr9 force le mode Web — bouton grisé, non cliquable visuellement
             self.b_conn.config(
                 text=f"  {t('conn_web')}  ",
-                fg=C["gold"], highlightthickness=1,
-                highlightbackground=C["gold"])
+                fg=C["muted"], highlightthickness=1,
+                highlightbackground=C["muted"],
+                cursor="arrow")
+            # Attacher le tooltip "pas de switch possible pour Torr9"
+            self._attach_torr9_conn_tooltip()
+        else:
+            if self._conn_mode == "api":
+                self.b_conn.config(
+                    text=f"  {t('conn_api')}  ",
+                    fg=C["green"], highlightthickness=1,
+                    highlightbackground=C["green"],
+                    cursor="hand2")
+            else:
+                self.b_conn.config(
+                    text=f"  {t('conn_web')}  ",
+                    fg=C["gold"], highlightthickness=1,
+                    highlightbackground=C["gold"],
+                    cursor="hand2")
+            self._detach_torr9_conn_tooltip()
         # Afficher/masquer les frames selon le mode
         if hasattr(self, "_frame_api") and hasattr(self, "_frame_web"):
-            if self._conn_mode == "api":
+            if self._conn_mode == "api" and not is_torr9:
                 self._frame_api.grid()
                 self._frame_web.grid_remove()
             else:
                 self._frame_api.grid_remove()
                 self._frame_web.grid()
 
+    def _attach_torr9_conn_tooltip(self):
+        """Attache le tooltip 'Pas de switch de mode possible pour Torr9' au bouton conn."""
+        if not hasattr(self, "_torr9_conn_tip"):
+            self._torr9_conn_tip = {"win": None, "_bound": False}
+        if self._torr9_conn_tip.get("_bound"):
+            return
+
+        def _show(e):
+            x = e.x_root + 16
+            y = e.y_root - 8
+            w = tk.Toplevel(self.root)
+            w.wm_overrideredirect(True)
+            w.wm_geometry(f"+{x}+{y}")
+            w.configure(bg=C["border"])
+            tk.Label(w, text="Pas de switch de mode\npossible pour Torr9",
+                     font=FM8, bg=C["panel"], fg=C["muted"],
+                     relief="flat", bd=0, padx=8, pady=4,
+                     justify="left").pack()
+            self._torr9_conn_tip["win"] = w
+
+        def _move(e):
+            if self._torr9_conn_tip.get("win"):
+                self._torr9_conn_tip["win"].wm_geometry(f"+{e.x_root+16}+{e.y_root-8}")
+
+        def _hide(e):
+            if self._torr9_conn_tip.get("win"):
+                self._torr9_conn_tip["win"].destroy()
+                self._torr9_conn_tip["win"] = None
+
+        self.b_conn.bind("<Enter>",  _show)
+        self.b_conn.bind("<Motion>", _move)
+        self.b_conn.bind("<Leave>",  _hide)
+        self._torr9_conn_tip["_bound"] = True
+
+    def _detach_torr9_conn_tooltip(self):
+        """Supprime le tooltip Torr9 du bouton conn."""
+        if not hasattr(self, "_torr9_conn_tip"):
+            return
+        if self._torr9_conn_tip.get("win"):
+            self._torr9_conn_tip["win"].destroy()
+            self._torr9_conn_tip["win"] = None
+        self.b_conn.unbind("<Enter>")
+        self.b_conn.unbind("<Motion>")
+        self.b_conn.unbind("<Leave>")
+        self._torr9_conn_tip["_bound"] = False
+
     def _toggle_conn_mode(self):
-        """Bascule entre mode API et mode Web."""
+        """Bascule entre mode API et mode Web.
+        Bloqué si Torr9 est le tracker actif (Web only)."""
+        if getattr(self, "_active_tracker", "lacale") == "torr9":
+            return  # no-op — tooltip géré par _add_conn_torr9_tooltip
         self._conn_mode = "api" if self._conn_mode == "web" else "web"
         self._update_conn_btn()
         cfg = self._collect()
@@ -3708,9 +5250,15 @@ class App:
 
     def _log_active_config(self):
         """Affiche la configuration active dans le log."""
-        conn  = "API" if self._conn_mode == "api" else "Web"
+        active = getattr(self, "_active_tracker", "lacale")
+        if active == "torr9":
+            tracker_name = "Torr9"
+            conn = "Web"  # Torr9 = Web only
+        else:
+            conn  = "API" if self._conn_mode == "api" else "Web"
+            tracker_name = "La Cale"
         client = "TRANSMISSION" if getattr(self, "_torrent_client", "qbittorrent") == "transmission" else "QBITTORRENT"
-        self._log(f"  Configuration active : La Cale/{conn}/{client}", "ok")
+        self._log(f"  Configuration active : {tracker_name}/{conn}/{client}", "ok")
 
     def _toggle_autosave(self):
         """Active ou désactive la sauvegarde automatique."""
@@ -3762,6 +5310,7 @@ class App:
         # États gérés hors self.vars
         cfg["conn_mode"]       = getattr(self, "_conn_mode", "web")
         cfg["torrent_client"]  = getattr(self, "_torrent_client", "qbittorrent")
+        cfg["active_tracker"]  = getattr(self, "_active_tracker", "lacale")
         cfg["autosave_enabled"]= getattr(self, "_autosave_enabled", True)
         cfg["notify_enabled"]  = getattr(self, "_notify_enabled", False)
         cfg["save_logs"]       = getattr(self, "_save_logs_enabled", True)
@@ -3782,15 +5331,10 @@ class App:
         self.log_box.insert("end", msg + "\n", tag or "")
         self.log_box.see("end")
         self.log_box.config(state="disabled")
-        # Écriture sur disque uniquement si activée
-        if getattr(self, "_save_logs_enabled", False):
-            try:
-                LOG_DIR.mkdir(parents=True, exist_ok=True)
-                log_file = LOG_DIR / f"blackflag_{time.strftime('%Y-%m-%d')}.log"
-                with open(log_file, "a", encoding="utf-8") as lf:
-                    lf.write(msg + "\n")
-            except Exception:
-                pass
+        # Accumuler dans le buffer de session (pour export en fin de session)
+        if not hasattr(self, "_session_log_buf"):
+            self._session_log_buf = []
+        self._session_log_buf.append(msg)
 
     def _on_log_right_click(self, event):
         """Menu contextuel clic droit sur le log."""
@@ -3820,6 +5364,12 @@ class App:
         self.log_box.config(state="disabled")
 
     def _set_prog(self, pct, lbl=""):
+        if pct < 0:
+            # Mode label seul : afficher le texte sans toucher à la barre
+            if lbl:
+                self.prog_lbl.config(text=lbl)
+                self._lbl_prog_above.grid()
+            return
         self.prog_bar["value"] = pct * 100
         if pct > 0:
             # Garder le compteur s'il est déjà affiché
@@ -3829,8 +5379,11 @@ class App:
             self.prog_lbl.config(text=f"{count_part} · {pct_str}" if count_part else pct_str)
             self._lbl_prog_above.grid()
         else:
-            self.prog_lbl.config(text="")
-            self._lbl_prog_above.grid_remove()
+            self.prog_lbl.config(text=lbl if lbl else "")
+            if lbl:
+                self._lbl_prog_above.grid()
+            else:
+                self._lbl_prog_above.grid_remove()
 
     def _set_prog_count(self, current, total):
         if total > 0:
@@ -3876,9 +5429,17 @@ class App:
         errs = []
         if not cfg.get("films_dir") and not cfg.get("series_dir"):
             errs.append(t("err_no_dir"))
-        if not cfg.get("lacale_user"):  errs.append(t("err_no_user"))
-        if not cfg.get("lacale_pass"):  errs.append(t("err_no_pass"))
-        if not cfg.get("tracker_url"):  errs.append(t("err_no_tracker"))
+
+        is_torr9 = (cfg.get("active_tracker", "lacale") == "torr9")
+
+        if is_torr9:
+            if not cfg.get("torr9_user"):  errs.append("Pseudonyme Torr9 requis")
+            if not cfg.get("torr9_pass"):  errs.append("Mot de passe Torr9 requis")
+        else:
+            if not cfg.get("lacale_user"):  errs.append(t("err_no_user"))
+            if not cfg.get("lacale_pass"):  errs.append(t("err_no_pass"))
+            if not cfg.get("tracker_url"):  errs.append(t("err_no_tracker"))
+
         if not cfg.get("qb_url"):       errs.append(t("err_no_qb"))
         if not _REQUESTS_OK:            errs.append(t("err_no_requests"))
         return errs
@@ -3896,7 +5457,58 @@ class App:
         self._log(t("log_films",  d=cfg.get("films_dir","—"),  m=cfg.get("max_movies",1)), "muted")
         self._log(t("log_series", d=cfg.get("series_dir","—"), m=cfg.get("max_series",1)), "muted")
         self._log("─" * 60, "muted")
+
+        # ── Vérification TMDb Bearer Token ────────────────────────────────────
+        if cfg.get("tmdb_token", "").strip():
+            self._log("  TMDb Bearer Token : Chargé ✓", "ok")
+        else:
+            self._log("  TMDb Bearer Token : Manquant — les métadonnées ne seront pas récupérées.", "err")
+            self.running = False
+            self.b_launch   .config(state="normal")
+            self.b_stop     .config(state="disabled")
+            self.b_autosave .config(state="normal")
+            self.b_clear_cfg.config(state="normal")
+            self.status.set(t("status_ready"))
+            return
+
+        # ── Vérification MediaInfo ────────────────────────────────────────────
+        import platform as _platform
+        _os = _platform.system()
+
+        # Chemins configurés pour chaque OS
+        _mi_candidates = {
+            "MediaInfo.dll":      Path(cfg.get("mediainfo_dll",   str(APP_DIR / "MediaInfo.dll"))).resolve(),
+            "libmediainfo.dylib": Path(cfg.get("mediainfo_dylib", str(APP_DIR / "libmediainfo.dylib"))).resolve(),
+            "libmediainfo.so":    Path(cfg.get("mediainfo_so",    str(APP_DIR / "libmediainfo.so"))).resolve(),
+        }
+
+        # Fichier attendu selon l'OS courant
+        _mi_expected = {
+            "Windows": "MediaInfo.dll",
+            "Darwin":  "libmediainfo.dylib",
+            "Linux":   "libmediainfo.so",
+        }.get(_os, "MediaInfo.dll")
+
+        _mi_found = next((n for n, p in _mi_candidates.items() if p.exists()), None)
+
+        if _mi_found:
+            self._log(f"  MediaInfo ({_mi_found}) : Chargé ✓", "ok")
+        else:
+            _mi_url = {
+                "Windows": "mediaarea.net/en/MediaInfo/Download/Windows",
+                "Darwin":  "mediaarea.net/en/MediaInfo/Download/Mac_OS",
+                "Linux":   "mediaarea.net/en/MediaInfo/Download/Ubuntu",
+            }.get(_os, "mediaarea.net/en/MediaInfo/Download/Windows")
+            self._log(f"  MediaInfo ({_mi_expected}) : Manquant — téléchargez-le sur {_mi_url}", "err")
+            self.running = False
+            self.b_launch   .config(state="normal")
+            self.b_stop     .config(state="disabled")
+            self.b_autosave .config(state="normal")
+            self.b_clear_cfg.config(state="normal")
+            self.status.set(t("status_ready"))
+            return
         self.running = True
+        self._start_session()
         self.b_launch   .config(state="disabled")
         self.b_stop     .config(state="normal")
         self.b_autosave .config(state="disabled")
@@ -3910,10 +5522,59 @@ class App:
         self.worker = Worker(cfg, log, done, prog,
                              start_watcher_cb=self._start_watcher,
                              set_count_cb=lambda c, t: self.root.after(
-                                 0, self._set_prog_count, c, t))
+                                 0, self._set_prog_count, c, t),
+                             curl_cb=lambda cmd: self._session_curl_buf.append(cmd))
         threading.Thread(target=self.worker.run, daemon=True).start()
 
+    def _start_session(self):
+        """Réinitialise le buffer log et curl pour la nouvelle session."""
+        self._session_log_buf  = []
+        self._session_curl_buf = []   # rempli par Worker via callback
+        # Timestamp à la seconde pour éviter les écrasements
+        self._session_ts       = time.strftime("%Y-%m-%d_%Hh%M%S")
+
+    def _export_session_files(self):
+        """
+        Exporte le log et/ou le fichier curl de la session courante.
+        Appelé à chaque fin de session (stop ou fin naturelle).
+        """
+        ts       = getattr(self, "_session_ts", time.strftime("%Y-%m-%d_%Hh%M%S"))
+        exported = []
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+            # ── Fichier LOG ───────────────────────────────────────────────────
+            if getattr(self, "_save_logs_enabled", False):
+                buf = getattr(self, "_session_log_buf", [])
+                if buf:
+                    log_path = LOG_DIR / f"blackflag_{ts}.log"
+                    log_path.write_text("\n".join(buf) + "\n", encoding="utf-8")
+                    exported.append(("log", str(log_path)))
+
+            # ── Fichier CURL ──────────────────────────────────────────────────
+            if getattr(self, "_save_curl_enabled", False):
+                curl_buf = getattr(self, "_session_curl_buf", [])
+                if curl_buf:
+                    curl_path = LOG_DIR / f"blackflag_{ts}.curl.sh"
+                    curl_path.write_text(
+                        "#!/bin/bash\n# BLACK FLAG — commandes curl de la session\n\n"
+                        + "\n\n".join(curl_buf) + "\n",
+                        encoding="utf-8")
+                    exported.append(("curl", str(curl_path)))
+        except Exception as e:
+            self._log(f"  Erreur export fichiers : {e}", "err")
+            return
+
+        # Messages dans le log UI en rouge
+        for kind, path in exported:
+            fname = Path(path).name
+            if kind == "log":
+                self._log(f"  Fichier log généré  →  {fname}", "err")
+            else:
+                self._log(f"  Fichier curl généré →  {fname}", "err")
+
     def _on_done(self):
+        self._export_session_files()
         self.running = False; self.worker = None
         self.b_launch   .config(state="normal")
         self.b_stop     .config(state="disabled")
@@ -3929,6 +5590,7 @@ class App:
             self.b_stop.config(state="disabled")
             self._log(t("log_stop"), "err")
             self.status.set(t("status_stopping"))
+            # L'export est géré par _on_done quand le Worker se termine
 
     def _close(self):
         if self.running and not messagebox.askyesno(
@@ -3954,6 +5616,15 @@ if __name__ == "__main__":
     try:
         ico = APP_DIR / "blackflag.ico"
         if ico.exists(): root.iconbitmap(str(ico))
+    except Exception:
+        pass
+    # Barre de titre sombre (Windows 10 build 19041+ / Windows 11)
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        # DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
     except Exception:
         pass
     App(root)
