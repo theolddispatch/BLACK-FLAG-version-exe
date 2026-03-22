@@ -130,18 +130,6 @@ Au premier lancement, renseigner dans **▶ PARAMÈTRES** :
 
 ---
 
-## 🔒 Chiffrement de la configuration
-
-Depuis la v1.4, la configuration peut être chiffrée avec **AES-256 via Fernet** (PBKDF2-SHA256, 260 000 itérations).
-
-- Activer dans **PARAMÈTRES → DIVERS → Chiffrement config**
-- Un mot de passe maître est demandé à la création, puis à chaque lancement
-- Le fichier `.blackflag_config.json` est remplacé par `.blackflag_config.enc`
-- Pour désactiver : basculer le toggle — la config repasse en JSON clair
-- En cas d'oubli du mot de passe : supprimer `.blackflag_config.enc` pour repartir vierge
-
----
-
 ## 🎵 Musiques intégrées
 
 Téléchargées automatiquement depuis [OpenGameArt.org](https://opengameart.org) au premier lancement :
@@ -182,16 +170,6 @@ Le résultat se trouve dans `dist/BLACK FLAG/`.
 ---
 
 ## 📜 Historique des versions
-
-### v1.4
-- **Support client Deluge 2.x** (JSON-RPC `/json`, port 8112) — ajout avec skip hash check (`seed_mode`)
-- **Chiffrement AES de la configuration** (Fernet/PBKDF2-SHA256, 260 000 itérations)
-- Popup mot de passe maître au lancement si config chiffrée détectée
-- Toggle « Chiffrement config » dans les paramètres Divers
-- Bootstrap `cryptography` auto-install silencieux
-- Bouton DELUGE dans la sélection du client torrent (aux côtés de QB et Transmission)
-- `_save_path()` helper : chaque client utilise ses propres chemins de sauvegarde
-- Seed check par hash limité à qBittorrent (Deluge et Transmission : skip)
 
 ### v1.3
 - Login La Cale corrigé (`/api/internal/auth/login`)
