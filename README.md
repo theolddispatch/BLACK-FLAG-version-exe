@@ -1,5 +1,5 @@
 # BLACK-FLAG-version-exe
-# v1.4
+# v1.3
 
 **Outil d'upload automatique vers [La Cale](https://la-cale.space) et [Torr9](https://torr9.net)**  
 *Développé par Theolddispatch & The40n8*  
