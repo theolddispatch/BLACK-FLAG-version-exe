@@ -1,78 +1,115 @@
 @echo off
-title BLACK FLAG - Build .exe
 chcp 65001 >nul
+title BLACK FLAG — Build EXE
+
 echo.
-echo  BLACK FLAG - Build .exe
-echo  ========================
+echo  ╔══════════════════════════════════════════╗
+echo  ║     BLACK FLAG v1.4 — Build Windows      ║
+echo  ║     PyInstaller packager                  ║
+echo  ╚══════════════════════════════════════════╝
 echo.
 
-:: Trouver Python (en privilegiant pythonw pour eviter la console)
-set PY=
-set PYW=
+:: ── Vérifier Python ──────────────────────────────────────────────────────────
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo  [ERREUR] Python introuvable dans le PATH.
+    echo  Installez Python 3.9+ depuis https://python.org
+    pause
+    exit /b 1
+)
 
-for %%C in (python3.exe python.exe) do (
-    if not defined PY (
-        where %%C >nul 2>&1 && (
-            for /f "tokens=*" %%V in ('%%C -c "import sys; print(sys.version_info.major)" 2^>nul') do (
-                if "%%V"=="3" set PY=%%C
-            )
-        )
+for /f "tokens=*" %%i in ('python --version 2^>^&1') do set PYVER=%%i
+echo  Python detecte : %PYVER%
+
+:: ── Vérifier / installer PyInstaller ─────────────────────────────────────────
+echo.
+echo  [1/4] Verification de PyInstaller...
+python -c "import PyInstaller" >nul 2>&1
+if errorlevel 1 (
+    echo  PyInstaller absent — installation en cours...
+    python -m pip install pyinstaller --quiet
+    if errorlevel 1 (
+        echo  [ERREUR] Impossible d'installer PyInstaller.
+        pause
+        exit /b 1
     )
-)
-:: Chercher pythonw.exe (version sans console) dans le meme dossier que python.exe
-if defined PY (
-    for /f "tokens=*" %%P in ('where %PY% 2^>nul') do (
-        if not defined PYW (
-            set "PYDIR=%%~dpP"
-        )
-    )
-    if exist "%PYDIR%pythonw.exe" set PYW=%PYDIR%pythonw.exe
+    echo  PyInstaller installe avec succes.
+) else (
+    for /f "tokens=*" %%i in ('python -c "import PyInstaller; print(PyInstaller.__version__)"') do set PIVER=%%i
+    echo  PyInstaller detecte : v%PIVER%
 )
 
-if not defined PY (
-    echo ERREUR : Python 3 introuvable.
-    echo Installez Python depuis https://www.python.org/downloads/windows/
-    pause & exit /b 1
-)
-echo Python    : %PY%
-if defined PYW echo PythonW   : %PYW%
-
-:: Verifier/installer PyInstaller
-%PY% -c "import PyInstaller" >nul 2>&1
+:: ── Vérifier les dépendances Python ──────────────────────────────────────────
+echo.
+echo  [2/4] Installation des dependances...
+python -m pip install requests pygame pymediainfo cryptography --quiet
 if errorlevel 1 (
-    echo Installation de PyInstaller...
-    %PY% -m pip install --quiet pyinstaller
+    echo  [ATTENTION] Certaines dependances n'ont pas pu etre installees.
+    echo  La compilation peut quand meme fonctionner si elles sont deja presentes.
+)
+echo  Dependances OK.
+
+:: ── Nettoyage des builds précédents ──────────────────────────────────────────
+echo.
+echo  [3/4] Nettoyage des anciens builds...
+if exist "dist\BLACK FLAG" (
+    rmdir /s /q "dist\BLACK FLAG"
+    echo  Ancien dist supprime.
+)
+if exist "build\BLACK FLAG" (
+    rmdir /s /q "build\BLACK FLAG"
+    echo  Ancien build supprime.
+)
+if exist "__pycache__" (
+    rmdir /s /q "__pycache__"
 )
 
-:: Verifier/installer requests
-%PY% -c "import requests" >nul 2>&1
-if errorlevel 1 (
-    echo Installation de requests...
-    %PY% -m pip install --quiet requests
-)
+:: ── Compilation ───────────────────────────────────────────────────────────────
+echo.
+echo  [4/4] Compilation en cours (peut prendre 2-5 minutes)...
+echo.
 
-:: pushd supporte les chemins UNC
-pushd "%~dp0"
-if errorlevel 1 (
-    echo ERREUR : impossible d'acceder au dossier %~dp0
-    pause & exit /b 1
-)
-
-echo Compilation en cours... (1-2 min)
-%PY% -m PyInstaller blackflag.spec --clean --noconfirm
+pyinstaller blackflag.spec --clean --noconfirm
 
 if errorlevel 1 (
-    popd
     echo.
-    echo ERREUR - Build echoue. Consultez les messages ci-dessus.
-    pause & exit /b 1
+    echo  ╔══════════════════════════════════════════╗
+    echo  ║  [ERREUR] La compilation a echoue.       ║
+    echo  ║  Verifiez les messages ci-dessus.        ║
+    echo  ╚══════════════════════════════════════════╝
+    pause
+    exit /b 1
 )
 
-popd
+:: ── Copier MediaInfo.dll si présent ──────────────────────────────────────────
+if exist "MediaInfo.dll" (
+    echo.
+    echo  Copie de MediaInfo.dll dans le dossier dist...
+    copy /y "MediaInfo.dll" "dist\BLACK FLAG\MediaInfo.dll" >nul
+    echo  MediaInfo.dll copie.
+)
 
+:: ── Copier l'icône si présente ───────────────────────────────────────────────
+if exist "blackflag.ico" (
+    copy /y "blackflag.ico" "dist\BLACK FLAG\blackflag.ico" >nul
+)
+
+:: ── Résultat ──────────────────────────────────────────────────────────────────
 echo.
-echo ================================================
-echo  BUILD OK  -  dist\BLACK FLAG\BLACK FLAG.exe
-echo ================================================
+echo  ╔══════════════════════════════════════════╗
+echo  ║  BUILD TERMINE AVEC SUCCES !             ║
+echo  ║                                          ║
+echo  ║  Executable : dist\BLACK FLAG\           ║
+echo  ║               BLACK FLAG.exe             ║
+echo  ╚══════════════════════════════════════════╝
 echo.
+echo  Pour distribuer : copiez tout le dossier dist\BLACK FLAG\
+echo  (ne deplacez pas seulement le .exe, il a besoin de ses fichiers)
+echo.
+
+:: Ouvrir le dossier dist dans l'explorateur
+if exist "dist\BLACK FLAG" (
+    explorer "dist\BLACK FLAG"
+)
+
 pause
