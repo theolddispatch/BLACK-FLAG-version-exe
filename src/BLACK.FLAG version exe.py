@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BLACK FLAG v1.3 — Upload automatique vers La Cale
-Développé par Theolddispatch & The40n8  ·  version exécutable
+BLACK FLAG v1.4 — Upload automatique vers La Cale et Torr9
+Version exécutable
 
 Logique séries :
-  - Scan par SAISON (dossier) : Breaking Bad/Saison 1/ → 1 torrent multi-fichiers
+  - Scan par SAISON (dossier) : Référence/Saison 1/ → 1 torrent multi-fichiers
   - Identification via nom du dossier SÉRIE (dossier parent)
   - Release name : Titre.S01.MULTi.1080p.WEB-DL.x265-GROUPE
   - TMDb : recherche série par nom + extraction saison du dossier
@@ -14,6 +14,7 @@ Logique séries :
 # ══════════════════════════════════════════════════════════════════════════════
 # BOOTSTRAP requests
 # ══════════════════════════════════════════════════════════════════════════════
+from platform import release
 import sys, subprocess, os
 
 def _bootstrap_requests():
@@ -82,6 +83,32 @@ _MEDIAINFO_OK = _bootstrap_mediainfo()
 if _MEDIAINFO_OK:
     from pymediainfo import MediaInfo as _MediaInfo
 
+
+def _bootstrap_cryptography():
+    """Auto-installe cryptography si absent — nécessaire pour le chiffrement de la config."""
+    try:
+        from cryptography.fernet import Fernet; return True
+    except ImportError:
+        pass
+    try:
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "cryptography"],
+            timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **kwargs)
+        from cryptography.fernet import Fernet; return True
+    except Exception:
+        return False
+
+_CRYPTO_OK = _bootstrap_cryptography()
+if _CRYPTO_OK:
+    from cryptography.fernet import Fernet as _Fernet
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes as _crypto_hashes
+    import base64 as _b64_crypto
+
 # ══════════════════════════════════════════════════════════════════════════════
 # IMPORTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,8 +158,8 @@ PLAYLIST = [
      "https://opengameart.org/sites/default/files/pirate.mp3"),
 ]
 
-APP_VERSION   = "1.3"
-APP_NEW_UPDATES = "v1.3 : Remplacez juste le fichier.py!\n- Login La Cale corrigé (/api/internal/auth/login)\n- Ajout de MediaInfo pour le .dll\n- Support Torr9\n- Fenêtre historique : date, état seed, tracker\n- Génération torrent + mise en seed QB avant upload\n- Logs horodatés (un fichier par session ou erreur)\n- Toggle vérification mises à jour\n- Vérification TMDb Bearer Token et MediaInfo au lancement (bloquant)\n- Support MediaInfo multi-OS (.dll Windows / .dylib macOS / .so Linux)\n- Tooltip QB path mis à jour"
+APP_VERSION   = "1.4"
+APP_NEW_UPDATES = "v1.4 : Remplacez juste le fichier.py!\n- Support clients Deluge 2.x (JSON-RPC) et Vuze (Web Remote)\n- 2 thèmes d'interface : Relief d'or / Naine Bleue\n- Chiffrement AES de la config (Fernet/PBKDF2, mot de passe maître au lancement)\n- Bouton mise à jour automatique depuis GitHub (Paramètres > Divers)\n- Logs path uniformisés pour tous les clients torrent\n- Génération curl désactivée par défaut\n- Lecture streaming GitHub pour vérification de version (lignes 100-250)"
 
 # URL du fichier source sur GitHub pour vérification de version
 _UPDATE_URL = (
@@ -148,27 +175,37 @@ _UPDATE_PAGE = (
 
 def _check_update_available():
     """
-    Télécharge le fichier source GitHub et compare la version.
-    Retourne (True, changelog) si une version plus récente est disponible,
+    Lit en streaming le fichier source GitHub (lignes 100 a 250 uniquement).
+    Ne telecharge pas le fichier entier — s arrete apres la ligne 250.
+    Retourne (True, changelog) si une version plus recente est disponible,
     (False, "") sinon.
     """
     if not _REQUESTS_OK:
         return False, ""
     try:
-        r = requests.get(_UPDATE_URL, timeout=10,
-                         headers={"User-Agent": "BLACK-FLAG-updater/1.1"})
+        r = requests.get(
+            _UPDATE_URL, timeout=10, stream=True,
+            headers={"User-Agent": "BLACK-FLAG-updater/" + APP_VERSION})
         if r.status_code != 200:
+            r.close()
             return False, ""
-        remote_version  = ""
+        remote_version   = ""
         remote_changelog = ""
-        for line in r.text.splitlines()[:160]:
-            stripped = line.strip()
-            if stripped.startswith("APP_VERSION") and "=" in stripped:
-                remote_version = stripped.split("=")[1].strip().strip("\"'")
-            if stripped.startswith("APP_NEW_UPDATES") and "=" in stripped:
-                remote_changelog = stripped.split("=", 1)[1].strip().strip("\"'")
+        line_num = 0
+        for raw_line in r.iter_lines(decode_unicode=True):
+            line_num += 1
+            if line_num < 100:
+                continue
+            if line_num > 250:
+                break
+            stripped = raw_line.strip()
+            if stripped.startswith('APP_VERSION') and '=' in stripped:
+                remote_version = stripped.split('=')[1].strip().strip("\"'")
+            if stripped.startswith('APP_NEW_UPDATES') and '=' in stripped:
+                remote_changelog = stripped.split('=', 1)[1].strip().strip("\"'")
             if remote_version and remote_changelog:
                 break
+        r.close()
         if not remote_version:
             return False, ""
         def _v(s):
@@ -196,6 +233,7 @@ def _check_bypass(val: str) -> bool:
     except Exception:
         return False
 VIDEO_EXTS  = {".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov"}
+SUB_EXTS    = {".srt", ".ass", ".ssa", ".sub", ".idx"}
 
 
 def _ensure_music():
@@ -230,6 +268,28 @@ C = dict(
     green="#22c55e", red="#ef4444",
     ibg="#141414", ifg="#e0e0e0",
 )
+
+# ── Palettes de thèmes ────────────────────────────────────────────────────────
+THEMES = {
+    "gold": dict(          # Relief d'or (thème original)
+        bg="#0d0d0d", panel="#111111", border="#1e1e1e",
+        gold="#eab308", gold_dim="#7a5c00",
+        text="#d4d4d4", muted="#4a4a4a",
+        green="#22c55e", red="#ef4444",
+        cyan="#38bdf8",
+        ibg="#141414", ifg="#e0e0e0",
+    ),
+    "blue": dict(          # Naine Bleue
+        bg="#06080f", panel="#0d1117", border="#1a2332",
+        gold="#38bdf8", gold_dim="#1e5f8a",
+        text="#cdd9e5", muted="#3d5166",
+        green="#22c55e", red="#ef4444",
+        cyan="#7dd3fc",
+        ibg="#0d1117", ifg="#cdd9e5",
+    ),
+}
+THEME_NAMES = {"gold": "Relief d'or", "blue": "Naine Bleue"}
+_current_theme = ["gold"]   # référence mutable
 FM  = ("Courier New", 9)
 FM8 = ("Courier New", 8)
 FB  = ("Courier New", 9, "bold")
@@ -312,6 +372,7 @@ DEFAULTS = {
     "torr9_url":       "https://torr9.net/upload",
     "torr9_user":      "",
     "torr9_pass":      "",
+    "torr9_token":     "",
     "torr9_announce":  "https://tracker.torr9.net/announce/****A CHANGER****",
     "mediainfo_dll":   "",
     "mediainfo_dylib": "",
@@ -328,20 +389,119 @@ DEFAULTS = {
     "notify_enabled":  False,
     "notify_interval": "10",   # minutes : "10", "20", "60"
     "save_logs":       True,
-    "save_curl":       True,
+    "save_curl":       False,
     "check_updates":   True,
+    "ui_lang":           "fr",
+    "ui_theme":          "gold",
+    "encrypt_cfg":       True,
+    "seed_check":        True,
+    "autosave_enabled":  True,
+    "deluge_url":        "http://192.168.1.x:8112",
+    "deluge_pass":       "",
+    "deluge_films_path": "/Films",
+    "deluge_series_path":"/Series",
+    "vuze_url":          "http://192.168.1.x:9091",
+    "vuze_user":         "vuze",
+    "vuze_pass":         "",
+    "vuze_films_path":   "/Films",
+    "vuze_series_path":  "/Series",
 }
+
+# ── Chiffrement config ───────────────────────────────────────────────────────
+_CRYPTO_SALT = b"BLACKFLAG_SALT_v14_2024"
+CONFIG_ENC_FILE = APP_DIR / ".blackflag_config.enc"
+# Mot de passe maître de session (défini par la popup au lancement)
+_SESSION_MASTER_PW = [None]   # [str|None]
+
+
+def _derive_key(password: str) -> bytes:
+    """Dérive une clé Fernet 32 octets depuis le mot de passe maître (PBKDF2-SHA256)."""
+    kdf = PBKDF2HMAC(
+        algorithm=_crypto_hashes.SHA256(),
+        length=32,
+        salt=_CRYPTO_SALT,
+        iterations=260_000,
+    )
+    raw = kdf.derive(password.encode("utf-8"))
+    return _b64_crypto.urlsafe_b64encode(raw)
+
+
+def _get_fernet():
+    """Retourne un Fernet avec le mot de passe maître de session, ou None."""
+    if not _CRYPTO_OK:
+        return None
+    pw = _SESSION_MASTER_PW[0]
+    if pw is None:
+        return None
+    try:
+        return _Fernet(_derive_key(pw))
+    except Exception:
+        return None
+
+
+def _encrypt_cfg(data: dict) -> bytes | None:
+    f = _get_fernet()
+    if f is None:
+        return None
+    try:
+        return f.encrypt(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _decrypt_cfg(blob: bytes) -> dict | None:
+    f = _get_fernet()
+    if f is None:
+        return None
+    try:
+        return json.loads(f.decrypt(blob).decode("utf-8"))
+    except Exception:
+        return None
+
 
 def load_cfg():
     d = dict(DEFAULTS)
+    # 1. Essai config chiffrée (si mot de passe de session disponible)
+    if CONFIG_ENC_FILE.exists() and _CRYPTO_OK and _SESSION_MASTER_PW[0]:
+        try:
+            dec = _decrypt_cfg(CONFIG_ENC_FILE.read_bytes())
+            if dec is not None:
+                d.update(dec)
+                return d
+            # mauvais mot de passe → on tombe sur le fallback JSON
+        except Exception:
+            pass
+    # 2. Fallback JSON clair
     if CONFIG_FILE.exists():
-        try: d.update(json.loads(CONFIG_FILE.read_text("utf-8")))
-        except Exception: pass
+        try:
+            d.update(json.loads(CONFIG_FILE.read_text("utf-8")))
+        except Exception:
+            pass
     return d
 
+
 def save_cfg(d):
-    try: CONFIG_FILE.write_text(json.dumps(d, indent=2, ensure_ascii=False), "utf-8")
-    except Exception: pass
+    encrypt = d.get("encrypt_cfg", True)
+    if encrypt and _CRYPTO_OK and _SESSION_MASTER_PW[0]:
+        blob = _encrypt_cfg(d)
+        if blob is not None:
+            try:
+                CONFIG_ENC_FILE.write_bytes(blob)
+                if CONFIG_FILE.exists():
+                    CONFIG_FILE.unlink(missing_ok=True)
+                return
+            except Exception:
+                pass
+    # JSON clair
+    if CONFIG_ENC_FILE.exists():
+        try:
+            CONFIG_ENC_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        CONFIG_FILE.write_text(json.dumps(d, indent=2, ensure_ascii=False), "utf-8")
+    except Exception:
+        pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PARSING — FILMS (fichier individuel)
@@ -373,94 +533,124 @@ def _unc_to_linux(path: str) -> str:
 def parse_filename(filename):
     stem = Path(filename).stem
     su   = stem.upper()
+    su = re.sub(r'\.(FR|EN|ES|PT|IT|DE|RO|RU|NL|PL|HI|TR|AR|EL|SV|DA|NO|FI)$', '', su)
+    su = su.replace("-SONARR", "").replace("-RADARR", "")
 
-    m    = re.search(r'(?<!\d)((?:19|20)\d{2})(?!\d)', su)
-    year = m.group(1) if m else ""
-    if year:
-        raw = re.split(re.escape(year), stem, flags=re.I, maxsplit=1)[0]
+    # --- 1. Correction Bug 1900/1923 (Titres numériques) ---
+    # Chercher d'abord une année entre parenthèses (ex: (1976))
+    m_year = re.search(r'\(((?:19|20)\d{2})\)', stem)
+    if m_year:
+        year = m_year.group(1)
+        raw = re.split(re.escape(f"({year})"), stem, flags=re.I, maxsplit=1)[0]
     else:
-        raw = re.split(r'(?i)[._](?:1080p|720p|2160p|4k|bluray|web.?dl|webrip|hdtv|x264|x265|hevc)', stem)[0]
+        # Sinon, chercher la DERNIÈRE occurrence d'une année pour éviter de confondre avec le titre
+        years = re.findall(r'(?<!\d)((?:19|20)\d{2})(?!\d)', su)
+        year = years[-1] if years else ""
+        if year:
+            raw = re.split(year, stem, flags=re.I)[0]
+        else:
+            raw = re.split(r'(?i)[._](?:1080p|720p|2160p|4k|bluray|web.?dl|webrip|hdtv|x264|x265|hevc)', stem)[0]
+    
     title = re.sub(r'[._\-]', ' ', raw).strip()
+    title = re.sub(r'^\s*\[.*?\]\s*', '', title)
+    title = re.sub(r'^\s*\(.*?\)\s*', '', title)
+    title = re.sub(r'\(?\s*$', '', title).strip()
 
-    # Nettoyer les parasites scène : [Torrent911.vc], (Torrent911), préfixes sites
-    title = re.sub(r'^\s*\[.*?\]\s*', '', title)          # supprimer [xxx] en début
-    title = re.sub(r'^\s*\(.*?\)\s*', '', title)          # supprimer (xxx) en début
-    title = re.sub(r'\(?\s*$', '', title).strip()          # supprimer parenthèse orpheline en fin
-    title = title.strip()
-
+    # --- 2. Détection Technique (Qualité, Codec, etc.) ---
     res = ""
     if   re.search(r'2160P|4K|UHD', su): res = "2160p"
     elif re.search(r'1080P', su):         res = "1080p"
     elif re.search(r'720P',  su):         res = "720p"
     elif re.search(r'480P',  su):         res = "480p"
+    # AJOUT : Détection de la définition standard (SD)
+    elif re.search(r'SDTV|SD\b|DVD(?:RIP|R)?\b', su): res = "SD"
+    if not res: res = "SD"
 
-    src = "WEB"
+    # --- Détection Technique (Source sécurisée) ---
+    src = "WEB-DL" # Fallback standard pour les sorties streaming
     for pat, val in [
-        (r'COMPLETE.UHD.BLU', "COMPLETE.UHD.BLURAY"),
-        (r'COMPLETE.BLU',     "COMPLETE.BLURAY"),
-        (r'BLU.?RAY.REMUX|BD.REMUX', "BluRay.REMUX"),
-        (r'(?<!UHD)REMUX',   "REMUX"),
-        (r'4KLIGHT',         "4KLight"),
-        (r'HDLIGHT',         "HDLight"),
-        (r'BLU.?RAY|BDRIP',  "BluRay"),
-        (r'WEB.?DL|WEBDL',   "WEB-DL"),
-        (r'WEBRIP',          "WEBRip"),
-        (r'DVDRIP',          "DVDRip"),
-        (r'HDTV',            "HDTV"),
+        (r'\bCOMPLETE\.UHD\.BLU\b',     "COMPLETE.UHD.BLURAY"),
+        (r'\bCOMPLETE\.BLU\b',         "COMPLETE.BLURAY"),
+        (r'\b(BLU.?RAY\.REMUX|BD\.REMUX)\b', "BluRay.REMUX"),
+        (r'(?<!UHD)\bREMUX\b',         "REMUX"),
+        (r'\b4KLIGHT\b',               "4KLight"),
+        (r'\bHDLIGHT\b',               "HDLight"),
+        (r'\b(BLU.?RAY|BDRIP|BRRIP)\b', "BluRay"),
+        (r'\b(WEB.?DL|WEBDL)\b',       "WEB-DL"),
+        (r'\bWEBRIP\b',                "WEBRip"),
+        (r'\bDVDRIP\b',                "DVDRip"),
+        (r'\bHDTV\b',                  "HDTV")
     ]:
-        if re.search(pat, su): src = val; break
+        if re.search(pat, su): 
+            src = val
+            break
 
     vc = "x264"
-    for pat, val in [(r'X265|H265|HEVC',"x265"),(r'X264|H264|AVC',"x264"),
-                     (r'AV1',"AV1"),(r'VC.?1',"VC-1")]:
+    for pat, val in [(r'X265|H265|HEVC',"x265"),(r'X264|H264|AVC',"x264"),(r'AV1',"AV1"),(r'VC.?1',"VC-1")]:
         if re.search(pat, su): vc = val; break
 
     ac = "AAC"
-    for pat, val in [(r'TRUEHD',"TrueHD"),(r'EAC3|E-AC3|DDP',"EAC3"),
-                     (r'AC3|\bDD\b',"AC3"),(r'DTS.?X\b',"DTS-X"),
-                     (r'DTS.HD.MA',"DTS-HD.MA"),(r'DTS.HD',"DTS-HD"),
-                     (r'\bDTS\b',"DTS"),(r'\bFLAC\b',"FLAC"),(r'\bOPUS\b',"OPUS")]:
+    for pat, val in [(r'TRUEHD',"TrueHD"),(r'EAC3|E-AC3|DDP',"EAC3"),(r'AC3|\bDD\b',"AC3"),(r'DTS.?X\b',"DTS-X"),
+                     (r'DTS.HD.MA',"DTS-HD.MA"),(r'DTS.HD',"DTS-HD"),(r'\bDTS\b',"DTS"),(r'\bFLAC\b',"FLAC"),(r'\bOPUS\b',"OPUS")]:
         if re.search(pat, su): ac = val; break
 
     ach   = next((v for p,v in [(r'7\.1',"7.1"),(r'5\.1',"5.1"),(r'2\.0',"2.0")] if re.search(p,su)),"")
-    atmos = "Atmos" if re.search(r'ATMOS', su) else ""
+    hdr   = "HDR10+" if re.search(r'HDR10\+|HDR10PLUS', su) else ("HDR" if re.search(r'HDR', su) else "")
+    if re.search(r'\bDV\b|DOLBY.?VISION', su): hdr = (hdr+".DV") if hdr else "DV"
 
-    hdr = ""
-    if   re.search(r'HDR10\+|HDR10PLUS', su): hdr = "HDR10+"
-    elif re.search(r'HDR', su):                hdr = "HDR"
-    if   re.search(r'\bDV\b|DOLBY.?VISION', su): hdr = (hdr+".DV") if hdr else "DV"
+# --- 3. Détection des Langues (Généralisée) ---
+    found_langs = []
+    # Liste exhaustive avec frontières de mots (\b) pour éviter de matcher dans le titre (ex: THINGS -> HIN)
+    lang_patterns = [
+        (r'\b(FRENCH|FR|VFF|VFQ|TRUEFRENCH)\b', "FRENCH"),
+        (r'\b(ENGLISH|EN|ENG|VO)\b', "ENGLISH"),
+        (r'\b(SPANISH|ESP)\b', "SPANiSH"),
+        (r'\b(ITALIAN|ITA)\b', "iTALiAN"),
+        (r'\b(GERMAN|GER|DEU)\b', "GERMAN"),
+        (r'\b(PORTUGUESE|POR)\b', "PORTUGUESE"),
+        (r'\b(ROMANIAN|ROU|ROM)\b', "ROMANiAN"),
+        (r'\b(RUSSIAN|RUS)\b', "RUSSiAN"),
+        (r'\b(DUTCH|HOL|NED)\b', "DUTCH"),
+        (r'\b(POLISH|POL)\b', "POLiSH"),
+        (r'\b(CHINESE|CHI|ZHO|MANDARIN)\b', "CHiNESE"),
+        (r'\b(JAPANESE|JAP|NIPPON)\b', "JAPANESE"),
+        (r'\b(KOREAN|KOR)\b', "KOREAN"),
+        (r'\b(HINDI|HIN)\b', "HiNDi"),
+        (r'\b(TURKISH|TUR|TRK)\b', "TURKiSH"),
+        (r'\b(ARABIC|ARA)\b', "ARABiC"),
+        (r'\b(GREEK|GRE|ELL)\b', "GREEK"),
+        (r'\b(SWEDISH|SWE)\b', "SWEDiSH"),
+        (r'\b(DANISH|DAN)\b', "DANiSH"),
+        (r'\b(NORWEGIAN|NOR)\b', "NORWEGiAN"),
+        (r'\b(FINNISH|FIN)\b', "FiNNiSH"),
+        (r'\b(PERSIAN|PER|FAR|FARSI)\b', "PERSiAN"),
+    ]
 
-    imax = "iMAX" if re.search(r'IMAX', su) else ""
+    # On scanne d'abord toutes les langues présentes dans le nom
+    for pat, val in lang_patterns:
+        if re.search(pat, su):
+            found_langs.append(val)
 
-    plat = ""
-    for code, pat in [("NF",r'\.NF\.|NETFLIX'),("AMZN",r'AMZN|AMAZON'),
-                      ("DSNP",r'DSNP|DISNEY'),("ATVP",r'ATVP'),
-                      ("MAX",r'HMAX|\.MAX\.'),("ADN",r'\.ADN\.')]:
-        if re.search(pat, su): plat = code; break
+    # Détection MULTi : mot-clé explicite OU au moins 2 langues différentes détectées
+    if re.search(r'\b(MULTI|DOUBLAGE|DUAL)\b|EN.*FR|FR.*EN', su) or len(set(found_langs)) >= 2:
+        lang = "MULTi"
+    elif found_langs:
+        lang = found_langs[0]
+    else:
+        lang = "FRENCH" # Fallback par défaut
 
-    lang = "FRENCH"
-    for pat, val in [(r'MULTI.*VFF|MULTI.*TRUEFRENCH',"MULTi.VFF"),
-                     (r'MULTI.*VFQ',"MULTi.VFQ"),(r'MULTI',"MULTi"),
-                     (r'TRUEFRENCH|VFF',"TRUEFRENCH"),(r'VOSTFR',"VOSTFR"),
-                     (r'FRENCH',"FRENCH"),(r'DUAL',"DUAL")]:
-        if re.search(pat, su): lang = val; break
-
+    # Edition et Groupe
     ed = ""
-    for pat, tag in [(r'\.DC\.|DIRECTOR.?S.?CUT',".DC"),(r'EXTENDED',".EXTENDED"),
-                     (r'UNRATED',".UNRATED"),(r'REMASTER',".REMASTERED"),
-                     (r'CRITERION',".CRiTERION")]:
+    for pat, tag in [(r'\.DC\.|DIRECTOR.?S.?CUT',".DC"),(r'EXTENDED',".EXTENDED"),(r'UNRATED',".UNRATED"),(r'REMASTER',".REMASTERED"),(r'CRITERION',".CRiTERION")]:
         if re.search(pat, su): ed += tag
-    ed = ed.lstrip(".")
-
     grp = ""
-    m = re.search(r'-([A-Za-z0-9]+)$', stem)
-    if m: grp = m.group(1)
+    m_grp = re.search(r'-([A-Za-z0-9]+)$', stem)
+    if m_grp: grp = m_grp.group(1)
 
     return dict(title=title, year=year, res=res, src=src, vc=vc, ac=ac,
-                ach=ach, atmos=atmos, hdr=hdr, imax=imax, plat=plat,
-                lang=lang, edition=ed, group=grp,
-                ext=Path(filename).suffix.lower())
-
+                ach=ach, lang=lang, edition=ed.lstrip("."), group=grp,
+                ext=Path(filename).suffix.lower(), hdr=hdr,
+                found_langs=found_langs) # AJOUTÉ ICI
 
 def _clean_title(t):
     t = unicodedata.normalize("NFD", t)
@@ -491,21 +681,20 @@ def build_release_name_movie(title, year, p):
 # PARSING — SÉRIES (dossier de saison)
 # ══════════════════════════════════════════════════════════════════════════════
 def parse_season_dir(season_dir: Path):
-    """
-    Analyse un dossier de saison et retourne ses métadonnées.
-    Exemples de noms supportés :
-      Saison 1 / Season 1 / S01 / Saison 01 / S1
-    Retourne : { series_name, season_num, files, tags_from_episodes }
-    """
     series_dir  = season_dir.parent
-    # Si season_dir est directement le dossier de la série (pas de sous-dossier saison)
-    # alors series_dir pointe vers la racine — on utilise season_dir.name comme nom
-    # Détection : le dossier parent ne contient pas de dossiers de saison typiques
-    if not re.search(r'(?:saison|season|s\d)', season_dir.name, re.I):
-        # season_dir EST le dossier de la série
-        series_name = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', season_dir.name).strip()
-    else:
-        series_name = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', series_dir.name).strip()
+    raw_dirname = series_dir.name if re.search(r'(?:saison|season|s\d)', season_dir.name, re.I) else season_dir.name
+    
+    # --- DÉTECTION DU NOM ET DE L'ANNÉE ---
+    # On cherche l'année (ex: (2016))
+    m_year = re.search(r'\(((?:19|20)\d{2})\)', raw_dirname)
+    series_year = m_year.group(1) if m_year else ""
+    
+    # On nettoie le nom de la série
+    series_name = re.sub(r'\s*\((?:19|20)\d{2}\)\s*$', '', raw_dirname).strip()
+
+    # Nettoyage pour TMDb : points → espaces, coupe au tiret de saison (ex: "24 - S01" → "24")
+    series_name = series_name.replace('.', ' ').strip()
+    series_name = series_name.split(' - ')[0].split(' — ')[0].strip()
 
     # Numéro de saison depuis le nom du dossier
     season_num = 1
@@ -513,27 +702,29 @@ def parse_season_dir(season_dir: Path):
     if m:
         season_num = int(m.group(1))
 
-    # Fichiers vidéo dans ce dossier (pas récursif — les épisodes sont au même niveau)
     files = sorted(f for f in season_dir.iterdir()
-                   if f.is_file() and f.suffix.lower() in VIDEO_EXTS)
+                   if f.is_file() and (f.suffix.lower() in VIDEO_EXTS or f.suffix.lower() in SUB_EXTS))
 
-    # Tags techniques : on les extrait du premier épisode trouvé
-    tags = {}
-    if files:
-        tags = parse_filename(files[0].name)
+    # --- NOUVEAU : Compter uniquement les vrais épisodes (vidéos) ---
+    video_count = sum(1 for f in files if f.suffix.lower() in VIDEO_EXTS)
+    
+    # On cherche le premier fichier vidéo pour extraire les tags
+    video_files = [f for f in files if f.suffix.lower() in VIDEO_EXTS]
+    ref_file = video_files[0] if video_files else (files[0] if files else None)
+    tags = parse_filename(ref_file.name) if ref_file else {}
 
-    # Taille totale de la saison
     total_size = sum(f.stat().st_size for f in files)
 
     return dict(
         series_name=series_name,
+        series_year=series_year,
         season_num=season_num,
         season_tag=f"S{season_num:02d}",
         files=files,
+        video_count=video_count, # AJOUTÉ
         total_size=total_size,
         tags=tags,
     )
-
 
 def build_release_name_season(series_title, season_tag, p):
     """Construit le nom de release pour une saison : Titre.S01.MULTi.1080p.WEB-DL.x265-GRP"""
@@ -644,8 +835,15 @@ def torrent_info_hash(torrent_bytes: bytes) -> str:
         return ""
 
 
-def make_torrent_single(fp: Path, tracker: str, prog_cb=None, source: str = "lacale") -> bytes:
-    """Torrent single-file (films)."""
+def make_torrent_single(fp: Path, tracker: str, prog_cb=None, source: str = "lacale",
+                        torrent_name: str = "") -> bytes:
+    """
+    Torrent single-file (films).
+    torrent_name : nom dans le dict info (= release name + ext).
+                   Si vide, utilise fp.name (nom fichier brut).
+                   IMPORTANT : doit correspondre exactement au nom stocké
+                   par le tracker pour que l'info-hash soit identique.
+    """
     sz = fp.stat().st_size
     pl = _piece_length(sz)
     pieces = bytearray()
@@ -657,7 +855,8 @@ def make_torrent_single(fp: Path, tracker: str, prog_cb=None, source: str = "lac
             pieces += hashlib.sha1(chunk).digest()
             read   += len(chunk)
             if prog_cb: prog_cb(read / sz)
-    info = {"name": fp.name, "piece length": pl, "pieces": bytes(pieces),
+    name = torrent_name if torrent_name else fp.name
+    info = {"name": name, "piece length": pl, "pieces": bytes(pieces),
             "length": sz, "private": 1, "source": source}
     return bencode({"announce": tracker, "info": info,
                     "created by": "BLACK FLAG", "creation date": int(time.time())})
@@ -665,51 +864,36 @@ def make_torrent_single(fp: Path, tracker: str, prog_cb=None, source: str = "lac
 
 def make_torrent_multi(folder_name: str, files: list, tracker: str, prog_cb=None,
                        source: str = "lacale") -> bytes:
-    """
-    Torrent multi-fichiers (saisons de séries).
-    folder_name : nom du dossier racine dans le torrent (= release_name, pour l'upload)
-    files       : liste de Path, tous dans le même dossier physique
-
-    IMPORTANT pour le seeding : le torrent.name = release_name, mais les fichiers
-    physiques sont dans season_dir. qBittorrent fait le lien grâce à skip_checking=true
-    + savepath pointant vers le dossier PARENT de season_dir.
-    """
+    """Version corrigée : hachage en flux continu pour éviter l'erreur libtorrent:12."""
     total_size = sum(f.stat().st_size for f in files)
     pl         = _piece_length(total_size)
     pieces     = bytearray()
     read       = 0
+    buf        = bytearray()
 
     for fp in files:
         with open(fp, "rb") as fh:
-            buf = b""
             while True:
-                chunk = fh.read(pl - len(buf))
+                needed = pl - len(buf)
+                chunk = fh.read(needed)
                 if not chunk:
                     break
                 buf += chunk
                 if len(buf) == pl:
                     pieces += hashlib.sha1(buf).digest()
-                    read   += len(buf)
-                    buf     = b""
+                    read   += pl
+                    buf.clear()
                     if prog_cb: prog_cb(read / total_size)
-        if buf:
-            pieces += hashlib.sha1(buf).digest()
-            read   += len(buf)
-            if prog_cb: prog_cb(read / total_size)
+    if buf:
+        pieces += hashlib.sha1(buf).digest()
+        read   += len(buf)
+        if prog_cb: prog_cb(read / total_size)
 
-    file_list = [{"length": f.stat().st_size,
-                  "path":   [f.name]} for f in files]
-    info = {
-        "name":         folder_name,
-        "piece length": pl,
-        "pieces":       bytes(pieces),
-        "files":        file_list,
-        "private":      1,
-        "source":       source,
-    }
+    file_list = [{"length": f.stat().st_size, "path": [f.name]} for f in files]
+    info = {"name": folder_name, "piece length": pl, "pieces": bytes(pieces),
+            "files": file_list, "private": 1, "source": source}
     return bencode({"announce": tracker, "info": info,
                     "created by": "BLACK FLAG", "creation date": int(time.time())})
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LA CALE CLIENT
@@ -746,6 +930,7 @@ class LaCale:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         self.cat_film   = None
         self.cat_series = None
+        self.cat_vo     = None
         self.quais      = {}
 
     def _get(self, p, **kw):  return self.sess.get(self.url + p,  timeout=20, **kw)
@@ -878,12 +1063,16 @@ class LaCale:
                     self.cat_film = c["id"]
                 if re.search(r"serie|tv|show", name) and not self.cat_series:
                     self.cat_series = c["id"]
+                if re.search(r"\bvo\b|version.?origin", name) and not self.cat_vo:
+                    self.cat_vo = c["id"]
         except Exception as e:
             pass
         if not self.cat_film:   self.cat_film   = "cmjoyv2cd00027eryreyk39gz"
         if not self.cat_series: self.cat_series = self.cat_film   # fallback
+        if not self.cat_vo:     self.cat_vo     = self.cat_film   # fallback : VO → Films si catégorie absente
         self.log(f"  Catégorie Films   : {self.cat_film}", "muted")
         self.log(f"  Catégorie Séries  : {self.cat_series}", "muted")
+        self.log(f"  Catégorie VO      : {self.cat_vo}", "muted")
 
         # Quais depuis la catégorie films
         try:
@@ -965,17 +1154,26 @@ class LaCale:
                     self.cat_film = c.get("id") or c.get("slug")
                 if re.search(r"serie|tv|show", name) and not self.cat_series:
                     self.cat_series = c.get("id") or c.get("slug")
+                if re.search(r"\bvo\b|version.?origin", name) and not self.cat_vo:
+                    self.cat_vo = c.get("id") or c.get("slug")
         except Exception:
             pass
         if not self.cat_film:   self.cat_film   = "cmjoyv2cd00027eryreyk39gz"
         if not self.cat_series: self.cat_series = self.cat_film
+        if not self.cat_vo:     self.cat_vo     = self.cat_film   # fallback : VO → Films si catégorie absente
         self.log(f"  Catégorie Films   : {self.cat_film}", "muted")
         self.log(f"  Catégorie Séries  : {self.cat_series}", "muted")
+        self.log(f"  Catégorie VO      : {self.cat_vo}", "muted")
 
     def upload_api(self, passkey, name, tb, nfo, desc,
-                   tmdb_id=None, is_series=False, terms=None):
-        """Upload via API externe /api/external/upload."""
-        cat   = self.cat_series if is_series else self.cat_film
+                   tmdb_id=None, is_series=False, terms=None, lang="FRENCH"):
+        """Upload via API externe /api/external/upload avec bascule automatique en catégorie VO."""
+        french_variants = {"FRENCH", "MULTi", "MULTi.VFF", "MULTi.VFQ", "TRUEFRENCH"}
+        if lang in french_variants:
+            cat = self.cat_series if is_series else self.cat_film
+        else:
+            cat = self.cat_vo
+            self.log(f"  La Cale : langue '{lang}' → catégorie VO ({cat})", "muted")
         files = {"file": (f"{name}.torrent", tb, "application/x-bittorrent")}
         if nfo: files["nfoFile"] = (f"{name}.nfo", nfo.encode("utf-8"), "text/plain")
         data  = {"title": name, "categoryId": cat}
@@ -997,9 +1195,17 @@ class LaCale:
                   body.get("slug") or (r.status_code == 200 and body))
         return ok, body
 
-    def upload(self, name, tb, nfo, desc, tmdb_id=None, is_series=False, terms=None):
-        """Upload via API interne (mode Web — simulation navigateur)."""
-        cat   = self.cat_series if is_series else self.cat_film
+    def upload(self, name, tb, nfo, desc, tmdb_id=None, is_series=False, terms=None, lang="FRENCH"):
+        """
+        Envoie le torrent vers La Cale (mode Web — simulation navigateur)
+        avec bascule automatique en catégorie VO.
+        """
+        french_variants = {"FRENCH", "MULTi", "MULTi.VFF", "MULTi.VFQ", "TRUEFRENCH"}
+        if lang in french_variants:
+            cat = self.cat_series if is_series else self.cat_film
+        else:
+            cat = self.cat_vo
+            self.log(f"  La Cale : langue '{lang}' → catégorie VO ({cat})", "muted")
         files = {"file": (f"{name}.torrent", tb, "application/x-bittorrent")}
         if nfo: files["nfoFile"] = (f"{name}.nfo", nfo.encode("utf-8"), "text/plain")
         data  = {"title": name, "categoryId": cat, "isAnonymous": "false",
@@ -1009,7 +1215,7 @@ class LaCale:
             data["tmdbType"] = "TV" if is_series else "MOVIE"
         r = self.sess.post(self.url + "/api/internal/torrents/upload",
                            data=data, files=files,
-                           params=[("termIds[]", t) for t in (terms or [])],
+                           params=[(("termIds[]"), t) for t in (terms or [])],
                            headers={"Accept": "application/json",
                                     "Referer": self.url + "/upload",
                                     "Origin": self.url},
@@ -1027,24 +1233,20 @@ class LaCale:
 class Torr9:
     """
     Client d'upload pour Torr9.
-    Authentification : login form → JWT token (stocké côté client dans localStorage).
+    Authentification : login form → JWT token via /api/v1/auth/login
+                    OU token stocké directement dans la config.
     Upload : POST multipart vers https://api.torr9.net/api/v1/torrents/upload
              avec Authorization: Bearer <token>.
-
-    Catégories détectées depuis le JS du site (chunk 33245) :
-      Films   → id=1  / Séries TV → id=4
-      Sous-catégories Films  : 51=Films, 2=Films d'animation, 3=Documentaires
-      Sous-catégories Séries : 5=Séries TV, 7=Séries Animées
     """
 
     API_BASE    = "https://api.torr9.net"
-    CAT_FILMS   = 1     # "Films"
-    CAT_SERIES  = 4     # "Séries"
-    SUBCAT_FILM = 51    # "Films" (sous-catégorie générique)
-    SUBCAT_TV   = 5     # "Séries TV"
+    CAT_FILMS   = 1
+    CAT_SERIES  = 4
+    SUBCAT_FILM = 51
+    SUBCAT_TV   = 5
 
     def __init__(self, url, log):
-        self.url   = url.rstrip("/")      # https://www.torr9.net
+        self.url   = url.rstrip("/")
         self.log   = log
         self.sess  = requests.Session()
         self.sess.headers.update({
@@ -1057,6 +1259,15 @@ class Torr9:
         self._token = ""
 
     # ── Auth ─────────────────────────────────────────────────────────────────
+    def set_token(self, token: str) -> bool:
+        """Utilise un token JWT déjà connu (stocké dans la config)."""
+        token = token.strip()
+        if not token:
+            return False
+        self._token = token
+        self.log("  Torr9 : token API chargé depuis la config.", "ok")
+        return True
+
     def login(self, username: str, password: str) -> bool:
         """Obtient un JWT Bearer depuis /api/v1/auth/login."""
         self.log("Connexion à Torr9...", "gold")
@@ -1136,17 +1347,41 @@ class Torr9:
 
     # ── Upload ───────────────────────────────────────────────────────────────
     def upload(self, name: str, tb: bytes, desc: str,
-               is_series: bool = False, tmdb_id=None, nfo: str = "") -> tuple:
+               is_series: bool = False, tmdb_id=None, nfo: str = "",
+               lang: str = "FRENCH", genres: str = "") -> tuple:
         """
-        Envoie le torrent vers api.torr9.net/api/v1/torrents/upload.
-        Retourne (ok: bool, body: dict).
-        """
-        cat    = self.CAT_SERIES  if is_series else self.CAT_FILMS
-        subcat = self.SUBCAT_TV   if is_series else self.SUBCAT_FILM
+        Envoie le torrent vers Torr9 via /api/v1/torrents/upload.
 
-        # Construire les catégories sous forme de noms (le JS utilise les noms)
-        cat_name    = "Séries" if is_series else "Films"
-        subcat_name = "Séries TV" if is_series else "Films"
+        Catégories confirmées par test API réel :
+          Films   → subcategory : "Films" | "Documentaires"
+          Séries  → subcategory : "Séries TV" | "Séries Animées"
+          VO      → subcategory : "Films" | "Séries"
+
+        Sélection automatique de la subcatégorie via les genres TMDb :
+          - "Animation" dans genres → Séries Animées
+          - "Documentaire" dans genres → Documentaires
+          - sinon → Films / Séries TV
+
+        Champs FormData confirmés (test réel mai 2025) :
+          torrent_file, title, description, nfo (texte), category,
+          subcategory, tags, is_exclusive, is_anonymous, tmdb_id
+        """
+        genres_lower = genres.lower()
+        french_variants = {"FRENCH", "MULTi", "MULTi.VFF", "MULTi.VFQ", "TRUEFRENCH"}
+
+        if lang in french_variants:
+            if is_series:
+                cat_name    = "Séries"
+                subcat_name = "Séries Animées" if "animation" in genres_lower else "Séries TV"
+            else:
+                cat_name    = "Films"
+                subcat_name = "Documentaires" if "documentaire" in genres_lower else "Films"
+        else:
+            # VO : Films ou Séries selon le type
+            cat_name    = "VO"
+            subcat_name = "Séries" if is_series else "Films"
+
+        self.log(f"  Torr9 catégorie : {cat_name} / {subcat_name}", "muted")
 
         data = {
             "title":        name,
@@ -1159,34 +1394,33 @@ class Torr9:
         }
         if tmdb_id:
             data["tmdb_id"] = str(tmdb_id)
-
-        files = {
-            "torrent_file": (f"{name}.torrent", tb, "application/x-bittorrent"),
-        }
         if nfo:
-            # Torr9 attend le NFO comme champ texte dans le FormData (pas comme fichier)
-            data["nfo"] = nfo
+            data["nfo"] = nfo   # texte brut MediaInfo, PAS un fichier multipart
+
+        files = {"torrent_file": (f"{name}.torrent", tb, "application/x-bittorrent")}
 
         try:
-            r = requests.post(
-                f"{self.API_BASE}/api/v1/torrents/upload",
-                data=data,
-                files=files,
-                headers=self._auth_headers(),
-                timeout=120)
+            r = requests.post(f"{self.API_BASE}/api/v1/torrents/upload",
+                data=data, files=files, headers=self._auth_headers(), timeout=600)
             body = {}
-            try:
-                body = r.json()
-            except Exception:
-                pass
-            ok = (r.status_code in (200, 201) and
-                  bool(body.get("torrent_id") or body.get("id") or
-                       body.get("success") or body.get("slug") or
-                       (r.status_code in (200, 201) and body)))
-            return ok, body
+            try: body = r.json()
+            except: pass
+
+            if r.status_code == 201:
+                # Succès confirmé : torrent reçu, en attente de validation modérateur
+                ok = bool(body.get("torrent_id"))
+                return ok, body
+            elif r.status_code == 409:
+                # Doublon détecté par le serveur
+                return False, body
+            elif r.status_code in (200,):
+                # Succès alternatif
+                ok = bool(body.get("torrent_id") or body.get("id") or body.get("success"))
+                return ok, body
+            else:
+                return False, body
         except Exception as e:
             return False, {"error": str(e)}
-
 
 
 class TMDb:
@@ -1501,21 +1735,423 @@ class Transmission:
                     "paused": False
                 }
             }
+            # Tentative d'envoi
             r = requests.post(
                 f"{self.url}/transmission/rpc",
                 json=payload,
                 headers={"X-Transmission-Session-Id": self._sid},
                 auth=self._auth, timeout=30)
+
+            # Gestion de l'expiration de session (Code 409)
+            if r.status_code == 409:
+                self._sid = r.headers.get("X-Transmission-Session-Id", "")
+                r = requests.post(
+                    f"{self.url}/transmission/rpc",
+                    json=payload,
+                    headers={"X-Transmission-Session-Id": self._sid},
+                    auth=self._auth, timeout=30)
+
             data = r.json()
             result = data.get("result", "")
+            if result != "success":
+                self.log(f"  Transmission add → résultat : {result}", "err")
             return result == "success"
-        except Exception:
+        except Exception as e:
+            self.log(f"  Transmission add → exception : {e}", "err")
             return False
 
+    def is_seeding(self, file_path: str) -> bool:
+        """Vérifie si le fichier est en seed dans Transmission."""
+        if not self.ok:
+            return True
+        try:
+            fname = Path(file_path).name.lower()
+            fstem = Path(file_path).stem.lower()
+            payload = {"method": "torrent-get",
+                       "arguments": {"fields": ["name", "status", "errorString", "percentDone"]}}
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                json=payload,
+                headers={"X-Transmission-Session-Id": self._sid},
+                auth=self._auth, timeout=10)
+            torrents = r.json().get("arguments", {}).get("torrents", [])
+            for t in torrents:
+                t_name = (t.get("name") or "").lower()
+                if fname in t_name or fstem == t_name:
+                    # Si le fichier est à 100%, on ignore l'erreur
+                    if t.get("percentDone") == 1:
+                        return True
+                    if t.get("status") == 16 or t.get("errorString"):
+                        self.log(f"  [seed check Transmission] '{fname}' en erreur.", "err")
+                        return False
+                    return True
+            return True
+        except Exception as e:
+            self.log(f"  [seed check Transmission] erreur : {e}", "muted")
+            return True
+
+    def get_torrent_state_by_hash(self, info_hash: str) -> tuple:
+        """Retourne l'état en ignorant les erreurs de tracker si le fichier est complété."""
+        if not self.ok:
+            return "", ""
+        try:
+            payload = {"method": "torrent-get",
+                       "arguments": {"ids": [info_hash],
+                                     "fields": ["name", "status", "errorString",
+                                                "downloadDir", "percentDone"]}}
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                json=payload,
+                headers={"X-Transmission-Session-Id": self._sid},
+                auth=self._auth, timeout=10)
+            torrents = r.json().get("arguments", {}).get("torrents", [])
+            if not torrents:
+                return "", ""
+            t = torrents[0]
+            status       = t.get("status", -1)
+            error_str    = t.get("errorString", "")
+            download_dir = t.get("downloadDir", "")
+            name         = t.get("name", "")
+            percent      = t.get("percentDone", 0)
+
+            # Force le seed si 100% (ignore l'erreur "Torrent not found" du tracker)
+            if percent == 1:
+                return "uploading", download_dir
+
+            if error_str or status == 16:
+                self.log(f"  Transmission cherche : {download_dir}/{name}", "err")
+                return "error", download_dir
+            STATUS_MAP = {0: "stoppedUP", 1: "checkingUP", 2: "checkingUP",
+                          3: "queuedUP",  4: "downloading", 5: "queuedUP", 6: "uploading"}
+            return STATUS_MAP.get(status, f"unknown_{status}"), download_dir
+        except Exception:
+            return "", ""
+
+    def is_seeding_by_name(self, release_name: str) -> bool:
+        """Vérifie si un torrent est en seed dans Transmission par son release name."""
+        GOOD = {"uploading", "stalledUP", "forcedUP", "queuedUP",
+                "checkingUP", "stoppedUP", "pausedUP", "moving"}
+        if not self.ok:
+            return False
+        try:
+            payload = {"method": "torrent-get",
+                       "arguments": {"fields": ["name", "status", "errorString"]}}
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                json=payload,
+                headers={"X-Transmission-Session-Id": self._sid},
+                auth=self._auth, timeout=10)
+            name_low = release_name.lower()
+            for t in r.json().get("arguments", {}).get("torrents", []):
+                t_name = (t.get("name") or "").lower()
+                if name_low in t_name or t_name in name_low:
+                    STATUS_MAP = {0: "stoppedUP", 1: "checkingUP", 2: "checkingUP",
+                                  3: "queuedUP",  4: "downloading", 5: "queuedUP",
+                                  6: "uploading"}
+                    return STATUS_MAP.get(t.get("status", -1), "") in GOOD
+        except Exception:
+            pass
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DELUGE CLIENT (JSON-RPC 2.x — endpoint /json, port 8112)
+# ══════════════════════════════════════════════════════════════════════════════
+class Deluge:
+    """
+    Client Deluge 2.x via l'API JSON-RPC interne.
+    Authentification : auth.login(password) → True/False.
+    Upload          : core.add_torrent_file(filename, base64, options).
+    Seed check      : core.get_torrents_status() → parcourt les noms.
+    """
+
+    def __init__(self, url, password, log):
+        self.url  = url.rstrip("/")
+        self.log  = log
+        self.ok   = False
+        self._id  = 0
+        self.sess = requests.Session()
+        self.sess.headers.update({"Content-Type": "application/json",
+                                   "Accept": "application/json"})
+        try:
+            r = self._rpc("auth.login", [password])
+            self.ok = bool(r and r.get("result") is True)
+            self.log(
+                "  Deluge : connecté." if self.ok
+                else "  Deluge : connexion échouée (mauvais mot de passe ?).",
+                "ok" if self.ok else "muted")
+        except Exception as e:
+            self.log(f"  Deluge : {e}", "muted")
+
+    def _rpc(self, method, params=None):
+        """Appel JSON-RPC → dict réponse ou None."""
+        self._id += 1
+        try:
+            r = self.sess.post(
+                f"{self.url}/json",
+                json={"method": method, "params": params or [], "id": self._id},
+                timeout=15)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return None
+
+    def add(self, tb, save_path, torrent_name):
+        """Ajoute un torrent dans Deluge et ignore l'erreur si déjà présent."""
+        if not self.ok:
+            return False
+        try:
+            import base64 as _b64
+            tb64 = _b64.b64encode(tb).decode()
+            opts = {
+                "download_location": save_path,
+                "add_paused": False,
+                "seed_mode":  True,
+            }
+            r = self._rpc("core.add_torrent_file",
+                          [torrent_name + ".torrent", tb64, opts])
+            
+            ok = bool(r and r.get("result"))
+            if not ok:
+                err = (r or {}).get("error")
+                # Si le torrent est déjà dans Deluge, on considère cela comme un succès
+                if err and "already in session" in str(err).lower():
+                    self.log("  Deluge : torrent déjà présent, on continue.", "muted")
+                    return True
+                if err:
+                    self.log(f"  Deluge add → erreur : {err}", "err")
+            return ok
+        except Exception as e:
+            self.log(f"  Deluge add → exception : {e}", "err")
+            return False
+
+    def is_seeding(self, file_path: str) -> bool:
+        """
+        Vérifie si le fichier est présent dans Deluge.
+        Même logique que QBit.is_seeding : absent = déjà seedé = OK.
+        """
+        if not self.ok:
+            return True
+        try:
+            fname = Path(file_path).name.lower()
+            fstem = Path(file_path).stem.lower()
+            r = self._rpc("core.get_torrents_status",
+                          [{}, ["name", "state"]])
+            torrents = (r or {}).get("result") or {}
+            for info_hash, t in torrents.items():
+                t_name = (t.get("name") or "").lower()
+                if fname in t_name or fstem == t_name:
+                    state = t.get("state", "")
+                    if state == "Error":
+                        self.log(f"  [seed check] '{fname}' en erreur Deluge.", "err")
+                        return False
+                    return True
+            return True   # absent → a déjà seedé
+        except Exception as e:
+            self.log(f"  [seed check Deluge] erreur : {e}", "muted")
+            return True
+
+    def get_torrent_state_by_hash(self, info_hash: str) -> tuple:
+        """
+        Retourne (state, save_path) d'un torrent Deluge par son info-hash.
+        Équivalent de QBit.get_torrent_state_by_hash pour le seed check post-add.
+        """
+        if not self.ok:
+            return "", ""
+        try:
+            r = self._rpc("core.get_torrent_status",
+                          [info_hash, ["state", "save_path", "name"]])
+            result = (r or {}).get("result") or {}
+            if not result:
+                return "", ""
+            state     = result.get("state", "")
+            save_path = result.get("save_path", "")
+            if state == "Error":
+                name = result.get("name", info_hash[:8])
+                self.log(f"  Deluge cherche : {save_path}/{name}", "err")
+            return state, save_path
+        except Exception:
+            return "", ""
+
+    def is_seeding_by_name(self, release_name: str) -> bool:
+        """Vérifie si un torrent est en seed dans Deluge par son release name."""
+        GOOD = {"Seeding", "Checking", "Queued"}
+        if not self.ok:
+            return False
+        try:
+            r = self._rpc("core.get_torrents_status", [{}, ["name", "state"]])
+            torrents = (r or {}).get("result") or {}
+            name_low = release_name.lower()
+            for info_hash, t in torrents.items():
+                t_name = (t.get("name") or "").lower()
+                if name_low in t_name or t_name in name_low:
+                    return t.get("state", "") in GOOD
+        except Exception:
+            pass
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VUZE CLIENT (protocole Transmission-compatible, plugin Vuze Web Remote)
+# ══════════════════════════════════════════════════════════════════════════════
+class Vuze:
+    """
+    Client Vuze (Azureus) via le plugin Vuze Web Remote.
+    Vuze implemente le meme protocole RPC que Transmission (endpoint /transmission/rpc,
+    port 9091 par defaut). Authentification : username "vuze" + code de pairing.
+
+    Prerequis : installer le plugin "Vuze Web Remote" depuis
+    Outils -> Plugins -> Installation depuis le depot -> "Vuze Web Remote".
+    Le code de pairing s'affiche dans l'interface du plugin.
+    """
+
+    def __init__(self, url, user, pwd, log):
+        self.url   = url.rstrip("/")
+        self.log   = log
+        self.ok    = False
+        self._auth = (user, pwd) if user else None
+        self._sid  = ""
+        try:
+            # Meme handshake que Transmission : POST -> 409 -> recuperer session-id
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                headers={"X-Transmission-Session-Id": ""},
+                auth=self._auth, timeout=10)
+            sid = r.headers.get("X-Transmission-Session-Id", "")
+            if sid:
+                self._sid = sid
+                self.ok   = True
+                self.log("  Vuze : connecte.", "ok")
+            else:
+                self.log(
+                    "  Vuze : connexion echouee "
+                    "(verifiez que le plugin Vuze Web Remote est actif).", "muted")
+        except Exception as e:
+            self.log(f"  Vuze : {e}", "muted")
+
+    def add(self, tb, save_path, torrent_name):
+        """Ajoute un torrent (bytes) dans Vuze via RPC Transmission-compatible."""
+        if not self.ok:
+            return False
+        try:
+            import base64 as _b64
+            torrent_b64 = _b64.b64encode(tb).decode()
+            payload = {
+                "method": "torrent-add",
+                "arguments": {
+                    "metainfo":     torrent_b64,
+                    "download-dir": save_path,
+                    "paused":       False,
+                }
+            }
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                json=payload,
+                headers={"X-Transmission-Session-Id": self._sid},
+                auth=self._auth, timeout=30)
+            data   = r.json()
+            result = data.get("result", "")
+            ok     = (result == "success")
+            if not ok:
+                self.log(f"  Vuze add -> resultat : {result}", "err")
+            return ok
+        except Exception as e:
+            self.log(f"  Vuze add -> exception : {e}", "err")
+            return False
+
+    def is_seeding(self, file_path: str) -> bool:
+        """Verifie si le fichier est en seed dans Vuze via torrent-get."""
+        if not self.ok:
+            return True
+        try:
+            fname = Path(file_path).name.lower()
+            fstem = Path(file_path).stem.lower()
+            payload = {
+                "method": "torrent-get",
+                "arguments": {"fields": ["name", "status", "errorString"]}
+            }
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                json=payload,
+                headers={"X-Transmission-Session-Id": self._sid},
+                auth=self._auth, timeout=10)
+            torrents = r.json().get("arguments", {}).get("torrents", [])
+            for t in torrents:
+                t_name = (t.get("name") or "").lower()
+                if fname in t_name or fstem == t_name:
+                    if t.get("status") == 16 or t.get("errorString"):
+                        self.log(f"  [seed check Vuze] '{fname}' en erreur.", "err")
+                        return False
+                    return True
+            return True
+        except Exception as e:
+            self.log(f"  [seed check Vuze] erreur : {e}", "muted")
+            return True
+
+    def get_torrent_state_by_hash(self, info_hash: str) -> tuple:
+        """
+        Retourne (state_str, download_dir) d'un torrent Vuze par son info-hash.
+        Vuze utilise le meme protocole RPC que Transmission.
+        """
+        if not self.ok:
+            return "", ""
+        try:
+            payload = {"method": "torrent-get",
+                       "arguments": {"ids": [info_hash],
+                                     "fields": ["name", "status",
+                                                "errorString", "downloadDir"]}}
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                json=payload,
+                headers={"X-Transmission-Session-Id": self._sid},
+                auth=self._auth, timeout=10)
+            torrents = r.json().get("arguments", {}).get("torrents", [])
+            if not torrents:
+                return "", ""
+            t = torrents[0]
+            status       = t.get("status", -1)
+            error_str    = t.get("errorString", "")
+            download_dir = t.get("downloadDir", "")
+            name         = t.get("name", "")
+            if error_str or status == 16:
+                self.log(f"  Vuze cherche : {download_dir}/{name}", "err")
+                return "error", download_dir
+            STATUS_MAP = {0: "stoppedUP", 1: "checkingUP", 2: "checkingUP",
+                          3: "queuedUP",  4: "downloading", 5: "queuedUP", 6: "uploading"}
+            return STATUS_MAP.get(status, f"unknown_{status}"), download_dir
+        except Exception:
+            return "", ""
+
+    def is_seeding_by_name(self, release_name: str) -> bool:
+        """Vérifie si un torrent est en seed dans Vuze par son release name."""
+        GOOD = {"uploading", "stalledUP", "forcedUP", "queuedUP",
+                "checkingUP", "stoppedUP", "pausedUP", "moving"}
+        if not self.ok:
+            return False
+        try:
+            payload = {"method": "torrent-get",
+                       "arguments": {"fields": ["name", "status", "errorString"]}}
+            r = requests.post(
+                f"{self.url}/transmission/rpc",
+                json=payload,
+                headers={"X-Transmission-Session-Id": self._sid},
+                auth=self._auth, timeout=10)
+            name_low = release_name.lower()
+            for t in r.json().get("arguments", {}).get("torrents", []):
+                t_name = (t.get("name") or "").lower()
+                if name_low in t_name or t_name in name_low:
+                    STATUS_MAP = {0: "stoppedUP", 1: "checkingUP", 2: "checkingUP",
+                                  3: "queuedUP",  4: "downloading", 5: "queuedUP",
+                                  6: "uploading"}
+                    return STATUS_MAP.get(t.get("status", -1), "") in GOOD
+        except Exception:
+            pass
+        return False
 
 
 def _L(label, value):
-    """Formate une ligne NFO style MediaInfo alignée."""
+    """Formate une ligne NFO style MediaInfo alignee."""
     return f"{label:<41}: {value}"
 
 
@@ -1662,9 +2298,10 @@ def make_nfo_film(fp, p, title, year, tmdb_id, imdb_id, rating, genres, sz):
             _L("Complete name",   fp.name),
             _L("Format",          "Matroska"),
             _L("File size",       f"{sz/1024**3:.2f} GiB"),
+            _L("Overall bit rate", "N/A (MediaInfo non lu)"),
             "", "Video",
             _L("Format",          vc_full),
-            _L("Width x Height",  res_map.get(p.get("res", ""), p.get("res", "N/A"))),
+            _L("Width x Height",  res_map.get(p.get("res", ""), p.get("res", "SD"))),
             _L("HDR format",      p.get("hdr", "") or "SDR"),
             _L("Original source", p.get("src", "WEB")),
             "", "Audio",
@@ -1684,6 +2321,17 @@ def make_nfo_film(fp, p, title, year, tmdb_id, imdb_id, rating, genres, sz):
         _L("Genres",    genres or "N/A"),
     ]
 
+    # --- AJOUT : Liste des fichiers (pour voir les sous-titres externes) ---
+    # On vérifie s'il y a des fichiers supplémentaires (subs) dans le dossier
+    movie_subs = [s for s in fp.parent.iterdir() 
+                 if s.is_file() and s.suffix.lower() in {".srt", ".ass", ".ssa", ".sub", ".idx"}]
+    
+    if movie_subs:
+        lines += ["", "Included Files"]
+        lines += [f"  {fp.name} (Main Video)"]
+        for sub in movie_subs:
+            lines += [f"  {sub.name}"]
+    # -----------------------------------------------------------------------
     # Nettoyer les lignes vides consécutives et les valeurs vides
     clean = []
     for l in lines:
@@ -1697,14 +2345,16 @@ def make_nfo_film(fp, p, title, year, tmdb_id, imdb_id, rating, genres, sz):
 def make_nfo_series(files, p, title, year, season_tag, tmdb_id, rating, genres, sz):
     """Génère un NFO style MediaInfo complet pour une saison (analyse le 1er épisode)."""
     # Analyser le premier épisode comme référence
-    ref_fp = files[0] if files else None
+    # Chercher le premier fichier VIDÉO pour le NFO (évite de prendre un .srt comme référence)
+    video_refs = [f for f in files if f.suffix.lower() in VIDEO_EXTS]
+    ref_fp = video_refs[0] if video_refs else (files[0] if files else None)
     mi = _mediainfo_block(ref_fp) if ref_fp else None
 
     lines = [
         "General",
         _L("Series name",  title),
         _L("Season",       season_tag),
-        _L("Episodes",     str(len(files))),
+        _L("Episodes", str(sum(1 for f in files if f.suffix.lower() in VIDEO_EXTS))),
         _L("Total size",   f"{sz/1024**3:.2f} GiB"),
         _L("Format",       "Matroska"),
         _L("Source",       p.get("src", "WEB")),
@@ -1716,6 +2366,7 @@ def make_nfo_series(files, p, title, year, season_tag, tmdb_id, rating, genres, 
             lines += ["", f"Video{' #'+str(i) if len(mi['video'])>1 else ''}"]
             lines += [
                 _L("Format",              v.get("format", "")),
+                _L("Bit rate",            _fmt_bitrate(v.get("bit_rate", ""))), # AJOUTÉ
                 _L("HDR format",          v.get("hdr_format", "") or v.get("hdr_format_commercial", "")),
                 _L("Width",               f"{int(v['width']):,} pixels".replace(",", " ") if v.get("width") else ""),
                 _L("Height",              f"{int(v['height']):,} pixels".replace(",", " ") if v.get("height") else ""),
@@ -1729,8 +2380,8 @@ def make_nfo_series(files, p, title, year, season_tag, tmdb_id, rating, genres, 
             lines += [
                 _L("Format",          a.get("format", "")),
                 _L("Commercial name", a.get("commercial_name", "") or a.get("format_commercial", "")),
+                _L("Bit rate",        _fmt_bitrate(a.get("bit_rate", ""))), # AJOUTÉ/VÉRIFIÉ
                 _L("Channel(s)",      f"{a['channel_s']} channels" if a.get("channel_s") else ""),
-                _L("Bit rate",        _fmt_bitrate(a.get("bit_rate", ""))),
                 _L("Language",        a.get("language", "")),
                 _L("Title",           a.get("title", "")),
             ]
@@ -1743,6 +2394,7 @@ def make_nfo_series(files, p, title, year, season_tag, tmdb_id, rating, genres, 
                 _L("Forced",   t.get("forced", "")),
             ]
     else:
+        # Fallback si MediaInfo échoue
         vc_map = {"x265": "HEVC", "x264": "AVC", "AV1": "AV1", "VC-1": "VC-1"}
         ac_map = {"TrueHD": "Dolby TrueHD", "EAC3": "Dolby Digital Plus",
                   "AC3": "Dolby Digital", "DTS-X": "DTS-X",
@@ -1783,10 +2435,8 @@ def make_nfo_series(files, p, title, year, season_tag, tmdb_id, rating, genres, 
 
     return "\n".join(clean)
 
-
-
 def make_bbcode(title, year_or_tag, overview, poster, res, vc, ac, lang,
-                size, rating, genres, cast, hdr, is_series=False, season_num=None):
+                size, rating, genres, cast, hdr, is_series=False, season_num=None, has_subs=False):
     pu = (f"https://image.tmdb.org/t/p/w500{poster}"
           if poster and not poster.startswith("http") else poster or "")
     rs  = f"{rating:.1f}" if isinstance(rating, float) else str(rating or "N/A")
@@ -1806,14 +2456,18 @@ def make_bbcode(title, year_or_tag, overview, poster, res, vc, ac, lang,
     bb += f"[b]Qualité :[/b] {res or 'N/A'}\n[b]Codec Vidéo :[/b] {vc}\n"
     bb += f"[b]Codec Audio :[/b] {ac}\n"
     if hdr: bb += f"[b]HDR :[/b] {hdr}\n"
-    bb += f"[b]Langue :[/b] {lang}\n[b]Taille totale :[/b] {ss}"
+    bb += f"[b]Langue :[/b] {lang}\n"
+    # --- AJOUT LIGNE SOUS-TITRES ---
+    if has_subs:
+        bb += "[b]Sous-titres :[/b] Externes inclus (.srt/.ass)\n"
+    # -------------------------------
+    bb += f"[b]Taille totale :[/b] {ss}"
     if cast:
         bb += "\n\n[color=#eab308][b]--- CASTING ---[/b][/color]\n\n"
         for a in cast[:5]:
             bb += f"[b]{a['name']}[/b] ({a.get('character', '')})\n"
-    bb += "\n\n[i]Généré par BLACK FLAG[/i]\n[/center]"
+    bb += "\n\n[/center]"
     return bb
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WORKER — Thread d'upload
@@ -1866,8 +2520,20 @@ class Worker:
                         self._start_watcher_cb()
                     return
 
-            if not t9.login(cfg.get("torr9_user", ""), cfg.get("torr9_pass", "")):
-                self.log("Abandon — connexion Torr9 impossible.", "err"); return
+            # Connexion selon le mode choisi
+            conn_mode = cfg.get("conn_mode", "web")
+            if conn_mode == "api":
+                # Mode API : utilise le token stocké
+                stored_token = cfg.get("torr9_token", "").strip()
+                if stored_token:
+                    if not t9.set_token(stored_token):
+                        self.log("Abandon — token Torr9 invalide.", "err"); return
+                else:
+                    self.log("  Mode API : aucun token trouvé — utilisez le bouton 'Récupérer' dans les paramètres.", "err"); return
+            else:
+                # Mode Web : login user/pass
+                if not t9.login(cfg.get("torr9_user", ""), cfg.get("torr9_pass", "")):
+                    self.log("Abandon — connexion Torr9 impossible.", "err"); return
 
             lc        = None
             conn_mode = "web"  # Torr9 = Web only
@@ -1912,11 +2578,39 @@ class Worker:
         if client_type == "transmission":
             qb = Transmission(cfg["tr_url"], cfg.get("tr_user", ""),
                               cfg.get("tr_pass", ""), self.log)
+        elif client_type == "deluge":
+            qb = Deluge(cfg.get("deluge_url", "http://localhost:8112"),
+                        cfg.get("deluge_pass", ""), self.log)
+        elif client_type == "vuze":
+            qb = Vuze(cfg.get("vuze_url", "http://localhost:9091"),
+                      cfg.get("vuze_user", "vuze"),
+                      cfg.get("vuze_pass", ""), self.log)
         else:
             qb = QBit(cfg["qb_url"], cfg["qb_user"], cfg["qb_pass"], self.log)
 
-        hist   = (set(HIST_FILE.read_text("utf-8", errors="ignore").splitlines())
-                  if HIST_FILE.exists() else set())
+        # Helper : retourne le bon chemin de sauvegarde selon le client actif
+        def _save_path(kind="films"):
+            ct = cfg.get("torrent_client", "qbittorrent")
+            if ct == "transmission":
+                key = "tr_films_path" if kind == "films" else "tr_series_path"
+            elif ct == "deluge":
+                key = "deluge_films_path" if kind == "films" else "deluge_series_path"
+            elif ct == "vuze":
+                key = "vuze_films_path" if kind == "films" else "vuze_series_path"
+            else:
+                key = "qb_films_path" if kind == "films" else "qb_series_path"
+            raw = cfg.get(key, "/Films" if kind == "films" else "/Series")
+            return _unc_to_linux(raw) if ct == "qbittorrent" else raw
+
+        hist = set()
+        if HIST_FILE.exists():
+            try:
+                for line in HIST_FILE.read_text("utf-8", errors="ignore").splitlines():
+                    if line.strip():
+                        # On ne garde que la partie avant la première tabulation (le nom du torrent/fichier)
+                        hist.add(line.split('\t')[0].strip())
+            except Exception as e:
+                self.log(f"  Erreur lecture historique : {e}", "muted")
         rank_q = {"": 0, "480p": 1, "720p": 2, "1080p": 3, "2160p": 4}
         min_q  = cfg.get("min_quality", "")
         total  = 0
@@ -1956,6 +2650,12 @@ class Worker:
                 for fp in files:
                     if self._stop.is_set() or uploaded >= max_films: break
                     fn = fp.name
+                    
+                    # --- SKIP IMMEDIAT HISTORIQUE ---
+                    if fn in hist:
+                        self.log(f"  SKIP : '{fn}' déjà dans l'historique — si l'upload a échoué à mi-chemin, supprimez cette entrée de uploaded_torrents.txt.", "muted")
+                        continue
+                    
                     self.log(f"\n  ▸ {fn}", "gold")
                     p  = parse_filename(fn)
 
@@ -1972,13 +2672,43 @@ class Worker:
                     rating   = 0.0; cast = []
 
                     if tmdb:
-                        self.log(f"  TMDb → \"{p['title']}\" ({year})...", "muted")
-                        res = tmdb.search_movie(p["title"], year or None)
+                        # Nettoyage du titre pour TMDb (pas de points traînants)
+                        search_title = p["title"].replace('.', ' ').strip('. ')
+                        self.log(f"  TMDb → \"{search_title}\" ({year})...", "muted")
+                        res = tmdb.search_movie(search_title, year or None)
                         if res:
                             tmdb_id = res.get("id")
                             det     = tmdb.movie_details(tmdb_id)
                             if det:
-                                title    = det.get("title") or title
+                                # --- NOUVELLE LOGIQUE : Détection de la langue d'origine TMDb ---
+                                # On récupère found_langs depuis le dictionnaire p
+                                f_langs = p.get("found_langs", [])
+                                
+                                iso_map = {
+                                    'fr': 'FRENCH',     'en': 'ENGLISH',    'es': 'SPANiSH',
+                                    'it': 'iTALiAN',    'de': 'GERMAN',     'pt': 'PORTUGUESE',
+                                    'ro': 'ROMANiAN',   'ru': 'RUSSiAN',    'nl': 'DUTCH',
+                                    'pl': 'POLiSH',     'zh': 'CHiNESE',    'ja': 'JAPANESE',
+                                    'ko': 'KOREAN',     'hi': 'HiNDi',      'tr': 'TURKiSH',
+                                    'ar': 'ARABiC',     'fa': 'PERSiAN',    'el': 'GREEK',
+                                    'sv': 'SWEDiSH',    'da': 'DANiSH',     'no': 'NORWEGiAN',
+                                    'fi': 'FiNNiSH',    'cs': 'CZECH',      'hu': 'HUNGARiAN',
+                                    'th': 'THAi'
+                                }
+                                
+                                orig_lang_iso = det.get("original_language", "")
+                                
+                                if orig_lang_iso in iso_map and orig_lang_iso != 'fr':
+                                    # On n'applique la VO que si le fichier n'est PAS MULTi (déjà bilingue)
+                                    if p.get('lang') != "MULTi" and "FRENCH" not in f_langs:
+                                        p['lang'] = iso_map[orig_lang_iso]
+                                        self.log(f"  Info : Langue originale détectée ({orig_lang_iso}) → {p['lang']}", "ok")
+
+                                # Titre original si film français, sinon titre FR
+                                if det.get("original_language") == "fr":
+                                    title = det.get("original_title") or det.get("title") or title
+                                else:
+                                    title    = det.get("title") or title
                                 year     = (det.get("release_date", ""))[:4]
                                 overview = det.get("overview", "")
                                 poster   = det.get("poster_path", "")
@@ -1989,7 +2719,8 @@ class Worker:
                                 imdb_id  = det.get("external_ids", {}).get("imdb_id", "")
                                 self.log(f"  TMDb OK : {title} ({year}) — {rating}/10", "ok")
                         else:
-                            self.log("  TMDb : non trouvé.", "muted")
+                            self.log(f"  SKIP : TMDb non trouvé pour '{p['title']}' (Recherche obligatoire).", "err")
+                            continue
 
                     # Release name
                     stem    = fp.stem
@@ -1997,126 +2728,173 @@ class Worker:
                               else build_release_name_movie(title, year, p)
                     self.log(f"  Release : {release}", "muted")
 
-                    if release in hist:
-                        if qb.ok and qb.is_seeding_by_name(release):
-                            self.log("  SKIP : déjà uploadé et en seed.", "muted"); continue
-                        elif not qb.ok:
-                            self.log("  SKIP : release déjà uploadée.", "muted"); continue
-                        else:
-                            self.log("  Dans l'historique mais plus en seed — on réessaie.", "muted")
-                            # Supprimer l'ancien torrent en erreur dans QB si présent
-                            if qb.ok:
-                                old_hash = qb.find_error_torrent_by_name(release)
-                                if old_hash:
-                                    if qb.delete_torrent(old_hash, delete_files=False):
-                                        self.log(f"  QB : ancien torrent en erreur supprimé ({old_hash[:8]}...).", "muted")
-                                    else:
-                                        self.log("  QB : impossible de supprimer l'ancien torrent.", "muted")
+                    if release in hist or fn in hist:
+                        self.log("  SKIP : Présent dans l'historique (uploaded_torrents.txt).", "muted")
+                        continue
 
                     if lc is not None and lc.count(title) > 0:
-                        self.log("  SKIP : déjà sur La Cale.", "muted"); continue
+                        self.log("  ◈ Doublon La Cale — déjà en ligne, laissez en seed.", "dup"); continue
                     # ── Vérification doublon Torr9 ────────────────────────────
                     if use_torr9 and t9.check_duplicate(release):
-                        self.log("  SKIP : doublon détecté sur Torr9.", "muted"); continue
+                        self.log("  ◈ Doublon Torr9 — déjà en ligne, laissez en seed.", "dup"); continue
 
                     # ── Génération torrent ────────────────────────────────────
+                    # ── Détection des sous-titres associés ──
+                    # On cherche tous les fichiers de sous-titres dans le même dossier que le film
+                    movie_subs = [s for s in fp.parent.iterdir() 
+                                 if s.is_file() and s.suffix.lower() in SUB_EXTS]
+                    
+                    # ── Génération torrent ──
                     self.log("  Hash SHA1...", "muted")
                     self.prog(0.0, f"Hash : {fn[:50]}")
                     try:
                         tracker_url    = cfg.get("torr9_announce", "") if use_torr9 else cfg.get("tracker_url", "")
                         torrent_source = "torr9" if use_torr9 else "lacale"
-                        tb = make_torrent_single(fp, tracker_url,
-                                                 lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"),
+                        
+                        if movie_subs:
+                            # S'il y a des sous-titres, on bascule en torrent MULTI-FICHIERS
+                            # IMPORTANT : On utilise le nom RÉEL du dossier sur le disque (ex: 28 Weeks Later (2007))
+                            # pour que Deluge retrouve les fichiers sans erreur.
+                            self.log(f"  Sous-titres détectés : {len(movie_subs)} fichier(s) inclus.", "ok")
+                            all_files = [fp] + movie_subs
+                            tb = make_torrent_multi(fp.parent.name, all_files, tracker_url,
+                                                lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"),
                                                  source=torrent_source)
+                        else:
+                            # Pas de sous-titres, on reste sur un torrent SINGLE-FILE classique
+                            _tname = fp.name 
+                            tb = make_torrent_single(fp, tracker_url,
+                                                 lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"),
+                                                 source=torrent_source,
+                                                 torrent_name=_tname)
                     except Exception as e:
                         self.log(f"  ERREUR torrent : {e}", "err"); continue
+
                     self.prog(1.0, "")
                     self.log(f"  Torrent : {len(tb)//1024} Ko", "ok")
-                    # Sauvegarder uniquement dans le dossier de sortie
-                    (out / f"{release}.torrent").write_bytes(tb)
+                    (out / f"{release}.torrent").write_bytes(tb)        
 
                     # ── NFO ───────────────────────────────────────────────────
                     sz  = fp.stat().st_size
                     nfo = make_nfo_film(fp, p, title, year, tmdb_id, imdb_id,
                                         rating, genres, sz)
                     self.log(f"  NFO : {'MediaInfo complet' if _MEDIAINFO_OK else 'fallback nom de fichier'}", "muted")
+                    # On utilise la variable movie_subs créée précédemment
                     desc = make_bbcode(title, year, overview, poster, p["res"],
                                        p["vc"], p["ac"], p["lang"], sz, rating,
-                                       genres, cast, p["hdr"], is_series=False)
+                                       genres, cast, p["hdr"], is_series=False,
+                                       has_subs=bool(movie_subs))
 
-                    # ── Chargement dans QB + mise en seed ─────────────────────
+                    # ── Chargement dans client torrent + mise en seed ─────────
                     if qb.ok:
-                        raw_path = cfg.get("qb_films_path", "/Films")
-                        self.log(f"  QB path config brut : '{raw_path}'", "muted")
-                        qb_films_root = _unc_to_linux(raw_path)
-                        self.log(f"  QB path converti    : '{qb_films_root}'", "muted")
-                        films_root    = Path(cfg.get("films_dir", ""))
-                        try:
-                            rel     = fp.parent.relative_to(films_root)
-                            rel_str = str(rel).replace("\\", "/")
-                            actual_save_path = qb_films_root if rel_str == "." else f"{qb_films_root}/{rel_str}"
-                        except ValueError:
-                            actual_save_path = qb_films_root
-                        if client_type == "transmission":
-                            actual_save_path = cfg.get("tr_films_path", "/Films")
+                        if client_type in ("transmission", "deluge", "vuze"):
+                            # On récupère la racine configurée (ex: /Movies)
+                            root_in_client = _save_path("films")
+                            # On récupère le chemin local configuré dans l'UI
+                            local_root = Path(cfg.get("films_dir", ""))
+                            try:
+                                # Calcul du chemin relatif
+                                rel = fp.parent.relative_to(local_root)
+                                rel_str = str(rel).replace("\\", "/")
+                                
+                                if movie_subs:
+                                    # Pour un pack (film + subs), on pointe vers le PARENT du dossier du film
+                                    # (ex: /Movies) car le torrent contient déjà le nom du dossier.
+                                    actual_save_path = root_in_client if rel_str == "." else str(Path(f"{root_in_client}/{rel_str}").parent).replace("\\", "/")
+                                else:
+                                    # Torrent simple : on garde le comportement actuel
+                                    actual_save_path = root_in_client if rel_str == "." else f"{root_in_client}/{rel_str}"
+                            except ValueError:
+                                actual_save_path = root_in_client
+                            self.log(f"  {client_type.capitalize()} path config : '{actual_save_path}'", "muted")
+                        else:
+                            raw_path = cfg.get("qb_films_path", "/Films")
+                            self.log(f"  QB path config brut : '{raw_path}'", "muted")
+                            qb_films_root = _unc_to_linux(raw_path)
+                            self.log(f"  QB path converti    : '{qb_films_root}'", "muted")
+                            films_root = Path(cfg.get("films_dir", ""))
+                            try:
+                                rel     = fp.parent.relative_to(films_root)
+                                rel_str = str(rel).replace("\\", "/")
+                                actual_save_path = qb_films_root if rel_str == "." else f"{qb_films_root}/{rel_str}"
+                            except ValueError:
+                                actual_save_path = qb_films_root
 
                         ih = torrent_info_hash(tb)
-                        self.log(f"  QB savepath → '{actual_save_path}'", "muted")
-                        self.log(f"  QB info-hash : {ih}", "muted")
+                        self.log(f"  Client savepath \u2192 '{actual_save_path}'", "muted")
+                        self.log(f"  Info-hash : {ih}", "muted")
                         added = qb.add(tb, actual_save_path, release)
                         if not added:
-                            self.log("  ERREUR : ajout dans qBittorrent échoué.", "err")
-                            self.log("  Arrêt du processus.", "err")
+                            self.log(f"  ERREUR : ajout dans {client_type} \u00e9chou\u00e9.", "err")
+                            self.log("  Arr\u00eat du processus.", "err")
                             self._stop.set(); break
                         time.sleep(1)
-                        qb.set_location(ih, actual_save_path)
+                        if client_type == "qbittorrent":
+                            qb.set_location(ih, actual_save_path)
 
-                        # ── Vérification seed par hash ────────────────────────
+                        # \u2500\u2500 V\u00e9rification seed (QB + Deluge) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                         seed_ok = False
-                        for attempt in range(3):
+                        if client_type in ("qbittorrent", "deluge",
+                                           "transmission", "vuze"):
+                          GOOD = {"uploading", "stalledUP", "forcedUP", "queuedUP",
+                                  "checkingUP", "stoppedUP", "pausedUP", "moving",
+                                  "Seeding", "Checking"}
+                          BAD  = {"missingFiles", "error", "Error"}
+                          for attempt in range(3):
                             for i in range(10, 0, -1):
                                 if self._stop.is_set(): break
                                 self.prog(-1, f"Mise en seed : {attempt*10+10-i}s...")
                                 time.sleep(1)
                             if self._stop.is_set(): break
                             state, cp = qb.get_torrent_state_by_hash(ih)
-                            if state in ("uploading", "stalledUP", "forcedUP",
-                                         "queuedUP", "checkingUP", "stoppedUP",
-                                         "pausedUP", "moving"):
+                            if state in GOOD:
                                 seed_ok = True
                                 break
-                            elif state in ("missingFiles", "error"):
-                                self.log(f"  ERREUR seed : état '{state}'", "err")
-                                self.log(f"  QB cherche : {cp}", "err")
+                            elif state in BAD:
+                                self.log(f"  ERREUR seed : \u00e9tat '{state}'", "err")
+                                self.log(f"  {client_type.capitalize()} cherche : {cp}", "err")
                                 self._stop.set(); break
-                            self.log(f"  [seed] état : {state or '?'} — attente...", "muted")
-                        self.prog(0, "")
-                        if self._stop.is_set(): break
-                        if not seed_ok:
-                            self.log("  ERREUR : seed non confirmé après 30s — arrêt.", "err")
+                            self.log(f"  [seed] \u00e9tat : {state or '?'} \u2014 attente...", "muted")
+                          self.prog(0, "")
+                          if self._stop.is_set(): break
+                          if not seed_ok:
+                            self.log("  ERREUR : seed non confirm\u00e9 apr\u00e8s 30s \u2014 arr\u00eat.", "err")
                             self._stop.set(); break
-                        self.log("  qBittorrent : seedé ✓", "ok")
+                          self.log(f"  {client_type.capitalize()} : seed\u00e9 \u2713", "ok")
+                        else:
+                          self.log(f"  {client_type.capitalize()} : ajout\u00e9 \u2713", "ok")
+
 
                     # ── Upload sur le tracker ─────────────────────────────────
                     self.log("  Upload...", "muted")
                     if use_torr9:
-                        ok, body = t9.upload(release, tb, desc,
-                                             is_series=False, tmdb_id=tmdb_id, nfo=nfo)
-                        link = f"https://torr9.net/torrents/{body.get('torrent_id','')}" if ok else ""
+                        ok, body = t9.upload(release, tb, desc, is_series=False, tmdb_id=tmdb_id, nfo=nfo, lang=p.get('lang', 'FRENCH'), genres=genres)
+                        t_id = body.get("torrent_id", "")
+                        link = f"https://torr9.net/torrents/{t_id}" if t_id else ""
+                        if ok:
+                            status_msg = body.get("status", "")
+                            self.log(f"  Torr9 : {body.get('message','OK')}", "ok")
+                            if status_msg == "pending":
+                                self.log("  ℹ️  En attente de validation par un modérateur.", "muted")
                     else:
                         terms = lc.build_terms(p, is_series=False)
                         if conn_mode == "api":
                             ok, body = lc.upload_api(passkey, release, tb, nfo, desc,
-                                                      tmdb_id=tmdb_id, is_series=False, terms=terms)
+                                                      tmdb_id=tmdb_id, is_series=False, terms=terms,
+                                                      lang=p.get('lang', 'FRENCH'))
                         else:
                             ok, body = lc.upload(release, tb, nfo, desc,
-                                                 tmdb_id=tmdb_id, is_series=False, terms=terms)
+                                                 tmdb_id=tmdb_id, is_series=False, terms=terms,
+                                                 lang=p.get('lang', 'FRENCH'))
                         slug = body.get("slug") or body.get("data", {}).get("slug", "")
                         link = f"{cfg['lacale_url']}/torrents/{slug}" if slug else ""
 
                     if not ok:
-                        msg = body.get("message") or body.get("error") or str(body)[:200]
-                        self.log(f"  ERREUR : {msg}", "err")
+                        msg = body.get("message") or body.get("error") or (str(body) if body else "Timeout / Réponse vide du serveur")
+                        if "dupliqu" in msg.lower() or "existe déjà" in msg.lower() or "already" in msg.lower():
+                            self.log("  ◈ Doublon serveur — déjà en ligne, laissez en seed.", "dup")
+                            continue
+                        self.log(f"  ERREUR d'upload : {msg}", "err")
                         if "limite" in msg.lower():
                             self.log("  Limite atteinte — arrêt.", "err"); break
                         continue
@@ -2155,6 +2933,12 @@ class Worker:
 
                 for season_dir in seasons:
                     if self._stop.is_set() or uploaded >= max_series: break
+                    
+                    # --- SKIP IMMEDIAT HISTORIQUE ---
+                    # On vérifie si le dossier (ex: 1883 - S01) a déjà été traité
+                    if season_dir.name in hist:
+                        self.log(f"  SKIP : '{season_dir.name}' déjà dans l'historique — si l'upload a échoué à mi-chemin, supprimez cette entrée de uploaded_torrents.txt.", "muted")
+                        continue
 
                     sd = parse_season_dir(season_dir)
                     if not sd["files"]:
@@ -2166,7 +2950,7 @@ class Worker:
                     season_tag  = sd["season_tag"]
                     season_num  = sd["season_num"]
 
-                    self.log(f"\n  ▸ {series_name} — {season_tag} ({len(sd['files'])} épisode(s))", "gold")
+                    self.log(f"\n  ▸ {series_name} — {season_tag} ({sd['video_count']} épisode(s))", "gold")
 
                     if min_q and rank_q.get(p.get("res", ""), 0) < rank_q.get(min_q, 0):
                         self.log(f"  SKIP : qualité {p.get('res')} < {min_q}", "muted"); continue
@@ -2184,17 +2968,43 @@ class Worker:
                     rating   = 0.0; cast = []
 
                     if tmdb:
-                        self.log(f"  TMDb → \"{series_name}\"...", "muted")
-                        res = tmdb.search_tv(series_name)
+                        self.log(f"  TMDb → \"{series_name}\" ({sd.get('series_year','—')})...", "muted")
+                        res = tmdb.search_tv(series_name, sd.get("series_year") or None)
                         if res:
                             tmdb_id = res.get("id")
                             det     = tmdb.tv_details(tmdb_id, season_num)
                             if det:
-                                title    = det.get("name") or series_name
+                                # --- NOUVELLE LOGIQUE : Détection de la langue d'origine TMDb ---
+                                f_langs = p.get("found_langs", []) # p est sd["tags"] ici
+                                
+                                iso_map = {
+                                    'fr': 'FRENCH',     'en': 'ENGLISH',    'es': 'SPANiSH',
+                                    'it': 'iTALiAN',    'de': 'GERMAN',     'pt': 'PORTUGUESE',
+                                    'ro': 'ROMANiAN',   'ru': 'RUSSiAN',    'nl': 'DUTCH',
+                                    'pl': 'POLiSH',     'zh': 'CHiNESE',    'ja': 'JAPANESE',
+                                    'ko': 'KOREAN',     'hi': 'HiNDi',      'tr': 'TURKiSH',
+                                    'ar': 'ARABiC',     'fa': 'PERSiAN',    'el': 'GREEK',
+                                    'sv': 'SWEDiSH',    'da': 'DANiSH',     'no': 'NORWEGiAN',
+                                    'fi': 'FiNNiSH',    'cs': 'CZECH',      'hu': 'HUNGARiAN',
+                                    'th': 'THAi'
+                                }
+                                
+                                orig_lang_iso = det.get("original_language", "")
+                                
+                                if orig_lang_iso in iso_map and orig_lang_iso != 'fr':
+                                    # On n'applique la VO que si le fichier n'est PAS MULTi (déjà bilingue)
+                                    if p.get('lang') != "MULTi" and "FRENCH" not in f_langs:
+                                        p['lang'] = iso_map[orig_lang_iso]
+                                        self.log(f"  Info : Langue originale détectée ({orig_lang_iso}) → {p['lang']}", "ok")
+
+                                # Nom original si série française, sinon nom FR
+                                if det.get("original_language") == "fr":
+                                    title = det.get("original_name") or det.get("name") or series_name
+                                else:
+                                    title    = det.get("name") or series_name
                                 year     = (det.get("first_air_date", ""))[:4]
                                 overview = det.get("overview", "")
                                 poster   = det.get("poster_path", "")
-                                # Poster de la saison si disponible
                                 s_det    = det.get("season_detail", {})
                                 if s_det.get("poster_path"):
                                     poster = s_det["poster_path"]
@@ -2206,51 +3016,66 @@ class Worker:
                                             for a in det.get("credits", {}).get("cast", [])[:5]]
                                 self.log(f"  TMDb OK : {title} — {season_tag} ({year}) — {rating}/10", "ok")
                         else:
-                            self.log("  TMDb : non trouvé.", "muted")
+                            self.log(f"  SKIP : TMDb non trouvé pour '{series_name}' (Recherche obligatoire).", "err")
+                            continue
 
                     # Release name : Titre.S01.MULTi.1080p.WEB-DL.x265-GRP
                     release = build_release_name_season(title, season_tag, p)
                     self.log(f"  Release : {release}", "muted")
 
-                    if release in hist:
-                        if qb.ok and qb.is_seeding_by_name(release):
-                            self.log("  SKIP : déjà uploadé et en seed.", "muted"); continue
-                        elif not qb.ok:
-                            self.log("  SKIP : release déjà uploadée.", "muted"); continue
-                        else:
-                            self.log("  Dans l'historique mais plus en seed — on réessaie.", "muted")
-                            # Supprimer l'ancien torrent en erreur dans QB si présent
-                            if qb.ok:
-                                old_hash = qb.find_error_torrent_by_name(release)
-                                if old_hash:
-                                    if qb.delete_torrent(old_hash, delete_files=False):
-                                        self.log(f"  QB : ancien torrent en erreur supprimé ({old_hash[:8]}...).", "muted")
-                                    else:
-                                        self.log("  QB : impossible de supprimer l'ancien torrent.", "muted")
+                    if release in hist or hist_key in hist:
+                        self.log(f"  SKIP : {series_name} {season_tag} déjà dans l'historique.", "muted")
+                        continue
 
                     if lc is not None and lc.count(title, is_series=True) > 0:
-                        self.log(f"  SKIP : déjà sur La Cale.", "muted"); continue
+                        self.log(f"  ◈ Doublon La Cale — déjà en ligne, laissez en seed.", "dup"); continue
 
                     # ── Vérification doublon Torr9 ────────────────────────────
                     if use_torr9 and t9.check_duplicate(release):
-                        self.log("  SKIP : doublon détecté sur Torr9.", "muted"); continue
+                        self.log("  ◈ Doublon Torr9 — déjà en ligne, laissez en seed.", "dup"); continue
 
                     # ── Génération torrent ────────────────────────────────────
-                    self.log(f"  Hash SHA1 ({len(sd['files'])} fichiers, {sd['total_size']/1024**3:.2f} GiB)...", "muted")
+                    self.log(f"  Hash SHA1 ({len(sd['files'])} fichiers)...", "muted")
                     self.prog(0.0, f"Hash saison : {release[:50]}")
                     try:
                         tracker_url    = cfg.get("torr9_announce", "") if use_torr9 else cfg.get("tracker_url", "")
                         torrent_source = "torr9" if use_torr9 else "lacale"
+                        # IMPORTANT : On utilise season_dir.name ("Season 1") comme nom interne
+                        # pour que Deluge trouve les fichiers sans chercher un sous-dossier release.
                         tb = make_torrent_multi(
-                            release, sd["files"], tracker_url,
+                            season_dir.name, sd["files"], tracker_url,
                             lambda pct: self.prog(pct, f"Hash {int(pct*100)}%"),
                             source=torrent_source)
                     except Exception as e:
                         self.log(f"  ERREUR torrent : {e}", "err"); continue
                     self.prog(1.0, "")
                     self.log(f"  Torrent : {len(tb)//1024} Ko", "ok")
-                    # Sauvegarder uniquement dans le dossier de sortie
                     (out / f"{release}.torrent").write_bytes(tb)
+
+                    # ── Chargement dans client torrent + mise en seed ─────────
+                    if qb.ok:
+                        if client_type in ("transmission", "deluge", "vuze"):
+                            root_in_client = _save_path("series")
+                            local_root = Path(cfg.get("series_dir", ""))
+                            try:
+                                # On pointe vers le dossier PARENT de "Season 1" (ex: /Series/1883)
+                                rel = season_dir.parent.relative_to(local_root)
+                                rel_str = str(rel).replace("\\", "/")
+                                actual_save_path = root_in_client if rel_str == "." else f"{root_in_client}/{rel_str}"
+                            except ValueError:
+                                actual_save_path = root_in_client
+                        else:
+                            # Logique qBittorrent classique
+                            qb_series_root   = _unc_to_linux(cfg.get("qb_series_path", "/Series"))
+                            series_root_path = Path(cfg.get("series_dir", ""))
+                            try:
+                                season_dir_path  = sd["files"][0].parent
+                                show_dir         = season_dir_path.parent
+                                rel              = show_dir.relative_to(series_root_path)
+                                rel_str          = str(rel).replace("\\", "/")
+                                actual_save_path = f"{qb_series_root}/{rel_str}" if rel_str != "." else qb_series_root
+                            except (ValueError, IndexError):
+                                actual_save_path = qb_series_root
 
                     # ── NFO ───────────────────────────────────────────────────
                     sz  = sd["total_size"]
@@ -2258,84 +3083,107 @@ class Worker:
                                           tmdb_id, rating, genres, sz)
                     self.log(f"  NFO : {'MediaInfo complet' if _MEDIAINFO_OK else 'fallback nom de fichier'}", "muted")
 
+                    # On vérifie si un des fichiers de la saison est un sous-titre
+                    has_external_subs = any(f.suffix.lower() in SUB_EXTS for f in sd["files"])
+
                     desc = make_bbcode(title, f"{year} — {season_tag}", overview, poster,
                                        p.get("res", ""), p.get("vc", "x264"),
                                        p.get("ac", "AAC"), p.get("lang", "FRENCH"),
                                        sz, rating, genres, cast, p.get("hdr", ""),
-                                       is_series=True, season_num=season_num)
+                                       is_series=True, season_num=season_num,
+                                       has_subs=has_external_subs)
 
-                    # ── Chargement dans QB + mise en seed ─────────────────────
+                    # ── Chargement dans client torrent + mise en seed ─────────
                     if qb.ok:
-                        qb_series_root   = _unc_to_linux(cfg.get("qb_series_path", "/Series"))
-                        series_root_path = Path(cfg.get("series_dir", ""))
-                        try:
-                            season_dir_path  = sd["files"][0].parent
-                            show_dir         = season_dir_path.parent
-                            rel              = show_dir.relative_to(series_root_path)
-                            rel_str          = str(rel).replace("\\", "/")
-                            actual_save_path = f"{qb_series_root}/{rel_str}" if rel_str != "." else qb_series_root
-                        except (ValueError, IndexError):
-                            actual_save_path = qb_series_root
-                        if client_type == "transmission":
-                            actual_save_path = cfg.get("tr_series_path", "/Series")
+                        if client_type in ("transmission", "deluge", "vuze"):
+                            root_in_client = _save_path("series")
+                            local_root = Path(cfg.get("series_dir", ""))
+                            try:
+                                # On calcule le chemin relatif du dossier contenant le dossier Saison
+                                rel = season_dir.parent.relative_to(local_root)
+                                rel_str = str(rel).replace("\\", "/")
+                                # On pointe Deluge vers le dossier PARENT du dossier "Season 1" (ex: /Series/1883)
+                                # Le client torrent ajoutera automatiquement "/Season 1" grâce au nom interne du torrent.
+                                actual_save_path = root_in_client if rel_str == "." else f"{root_in_client}/{rel_str}"
+                            except ValueError:
+                                actual_save_path = root_in_client
+                            self.log(f"  {client_type.capitalize()} path config : '{actual_save_path}'", "muted")
 
                         ih = torrent_info_hash(tb)
-                        self.log(f"  QB savepath → '{actual_save_path}'", "muted")
-                        self.log(f"  QB info-hash : {ih}", "muted")
+                        self.log(f"  Client savepath \u2192 '{actual_save_path}'", "muted")
+                        self.log(f"  Info-hash : {ih}", "muted")
                         added = qb.add(tb, actual_save_path, release)
                         if not added:
-                            self.log("  ERREUR : ajout dans qBittorrent échoué.", "err")
-                            self.log("  Arrêt du processus.", "err")
+                            self.log(f"  ERREUR : ajout dans {client_type} \u00e9chou\u00e9.", "err")
+                            self.log("  Arr\u00eat du processus.", "err")
                             self._stop.set(); break
                         time.sleep(1)
-                        qb.set_location(ih, actual_save_path)
+                        if client_type == "qbittorrent":
+                            qb.set_location(ih, actual_save_path)
 
-                        # ── Vérification seed par hash ────────────────────────
+                        # \u2500\u2500 V\u00e9rification seed (QB + Deluge) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
                         seed_ok = False
-                        for attempt in range(3):
+                        if client_type in ("qbittorrent", "deluge",
+                                           "transmission", "vuze"):
+                          GOOD = {"uploading", "stalledUP", "forcedUP", "queuedUP",
+                                  "checkingUP", "stoppedUP", "pausedUP", "moving",
+                                  "Seeding", "Checking"}
+                          BAD  = {"missingFiles", "error", "Error"}
+                          for attempt in range(3):
                             for i in range(10, 0, -1):
                                 if self._stop.is_set(): break
                                 self.prog(-1, f"Mise en seed : {attempt*10+10-i}s...")
                                 time.sleep(1)
                             if self._stop.is_set(): break
                             state, cp = qb.get_torrent_state_by_hash(ih)
-                            if state in ("uploading", "stalledUP", "forcedUP",
-                                         "queuedUP", "checkingUP", "stoppedUP",
-                                         "pausedUP", "moving"):
+                            if state in GOOD:
                                 seed_ok = True
                                 break
-                            elif state in ("missingFiles", "error"):
-                                self.log(f"  ERREUR seed : état '{state}'", "err")
-                                self.log(f"  QB cherche : {cp}", "err")
+                            elif state in BAD:
+                                self.log(f"  ERREUR seed : \u00e9tat '{state}'", "err")
+                                self.log(f"  {client_type.capitalize()} cherche : {cp}", "err")
                                 self._stop.set(); break
-                            self.log(f"  [seed] état : {state or '?'} — attente...", "muted")
-                        self.prog(0, "")
-                        if self._stop.is_set(): break
-                        if not seed_ok:
-                            self.log("  ERREUR : seed non confirmé après 30s — arrêt.", "err")
+                            self.log(f"  [seed] \u00e9tat : {state or '?'} \u2014 attente...", "muted")
+                          self.prog(0, "")
+                          if self._stop.is_set(): break
+                          if not seed_ok:
+                            self.log("  ERREUR : seed non confirm\u00e9 apr\u00e8s 30s \u2014 arr\u00eat.", "err")
                             self._stop.set(); break
-                        self.log("  qBittorrent : seedé ✓", "ok")
+                          self.log(f"  {client_type.capitalize()} : seed\u00e9 \u2713", "ok")
+                        else:
+                          self.log(f"  {client_type.capitalize()} : ajout\u00e9 \u2713", "ok")
+
 
                     # ── Upload sur le tracker ─────────────────────────────────
                     self.log("  Upload...", "muted")
                     if use_torr9:
-                        ok, body = t9.upload(release, tb, desc,
-                                             is_series=True, tmdb_id=tmdb_id, nfo=nfo)
-                        link = f"https://torr9.net/torrents/{body.get('torrent_id','')}" if ok else ""
+                        ok, body = t9.upload(release, tb, desc, is_series=True, tmdb_id=tmdb_id, nfo=nfo, lang=p.get('lang', 'FRENCH'), genres=genres)
+                        t_id = body.get("torrent_id", "")
+                        link = f"https://torr9.net/torrents/{t_id}" if t_id else ""
+                        if ok:
+                            status_msg = body.get("status", "")
+                            self.log(f"  Torr9 : {body.get('message','OK')}", "ok")
+                            if status_msg == "pending":
+                                self.log("  ℹ️  En attente de validation par un modérateur.", "muted")
                     else:
                         terms = lc.build_terms(p, is_series=True)
                         if conn_mode == "api":
                             ok, body = lc.upload_api(passkey, release, tb, nfo, desc,
-                                                      tmdb_id=tmdb_id, is_series=True, terms=terms)
+                                                      tmdb_id=tmdb_id, is_series=True, terms=terms,
+                                                      lang=p.get('lang', 'FRENCH'))
                         else:
                             ok, body = lc.upload(release, tb, nfo, desc,
-                                                 tmdb_id=tmdb_id, is_series=True, terms=terms)
+                                                 tmdb_id=tmdb_id, is_series=True, terms=terms,
+                                                 lang=p.get('lang', 'FRENCH'))
                         slug = body.get("slug") or body.get("data", {}).get("slug", "")
                         link = f"{cfg['lacale_url']}/torrents/{slug}" if slug else ""
 
                     if not ok:
-                        msg = body.get("message") or body.get("error") or str(body)[:200]
-                        self.log(f"  ERREUR : {msg}", "err")
+                        msg = body.get("message") or body.get("error") or (str(body) if body else "Timeout / Réponse vide du serveur")
+                        if "dupliqu" in msg.lower() or "existe déjà" in msg.lower() or "already" in msg.lower():
+                            self.log("  ◈ Doublon serveur — déjà en ligne, laissez en seed.", "dup")
+                            continue
+                        self.log(f"  ERREUR d'upload : {msg}", "err")
                         if "limite" in msg.lower():
                             self.log("  Limite atteinte — arrêt.", "err"); break
                         continue
@@ -2395,7 +3243,7 @@ LANGS_UI = {
 T = {
     "fr": dict(
         title="BLACK FLAG v{v}",
-        subtitle="Développé par Theolddispatch & The40n8  ·  version exécutable  ·  v{v}",
+        subtitle="Version exécutable  ·  v{v}",
         log_header="  JOURNAL DE BORD",
         btn_clear="Effacer log",
         btn_history="Historique des uploads",
@@ -2468,7 +3316,7 @@ T = {
         lbl_notify_interval="Intervalle de vérification :",
         notify_hint="Activé auto si le site est KO",
         tip_qb_url="ex: http://192.168.1.x:8080",
-        tip_qb_path="Chemin d'accès aux fichiers, vu par Qbittorrent en local.\n(normalement même chemin que les deux premiers champs)\nConnexion pour Nas/Serveurs en cours de travail pour la prochaine release",
+        tip_qb_path="Chemin des fichiers, vu par Qbittorrent en local.\n(Normalement identique aux deux premiers champs en \\.)\nPour Nas/Serveurs, variable selon container, juste dupliquer l'avant dossier en /\n(exemple: /Films/Films)",
         btn_qb_fetch="↺ Récupérer",
         tmdb_link="Clé gratuite → themoviedb.org/settings/api",
         hist_title="Historique des uploads",
@@ -2495,7 +3343,7 @@ T = {
     ),
     "en": dict(
         title="BLACK FLAG v{v}",
-        subtitle="Developed by Theolddispatch & The40n8  ·  executable release  ·  v{v}",
+        subtitle="Executable release  ·  v{v}",
         log_header="  LOG",
         btn_clear="Clear log",
         btn_history="Upload history",
@@ -2568,7 +3416,7 @@ T = {
         lbl_notify_interval="Check interval :",
         notify_hint="Auto-enabled when site is down",
         tip_qb_url="ex: http://192.168.1.x:8080",
-        tip_qb_path="Linux path on the NAS",
+        tip_qb_path="File path as seen by qBittorrent locally.\n(Normally identical to the first two fields, using \\.)\nFor NAS/Servers, varies by container — just duplicate the parent folder in /\n(example: /Movies/Movies)",
         btn_qb_fetch="↺ Fetch",
         tmdb_link="Free key → themoviedb.org/settings/api",
         hist_title="Upload history",
@@ -2595,7 +3443,7 @@ T = {
     ),
     "es": dict(
         title="BLACK FLAG v{v}",
-        subtitle="Desarrollado por Theolddispatch & The40n8  ·  versión ejecutable  ·  v{v}",
+        subtitle="Versión ejecutable  ·  v{v}",
         log_header="  REGISTRO",
         btn_clear="Borrar log",
         btn_history="Historial de uploads",
@@ -2665,7 +3513,7 @@ T = {
         lbl_notify_interval="Intervalo :",
         notify_hint="Activado auto si el sitio está caído",
         tip_qb_url="ej: http://192.168.1.x:8080",
-        tip_qb_path="ruta Linux en el NAS",
+        tip_qb_path="Ruta de archivos vista por qBittorrent en local.\n(Normalmente idéntica a los dos primeros campos, con \\.)\nPara NAS/Servidores, varía según container — duplicar la carpeta padre en /\n(ejemplo: /Peliculas/Peliculas)",
         btn_qb_fetch="↺ Obtener",
         tmdb_link="Clave gratuita → themoviedb.org/settings/api",
         hist_title="Historial de uploads",
@@ -2689,14 +3537,17 @@ T = {
         log_series="   Series : {d}  (max {m})",
         log_saved="Configuración guardada.",
         log_stop="■  Detención solicitada...",
+        lbl_seed_check="Verificación seed QB :",
+        seed_check_on="OBLIGATORIO",
+        seed_check_off="DESACTIVADO",
     ),
 }
 # Langues supplémentaires (basées sur fr, avec sous-titre traduit)
 _SUBTITLES = {
-    "de": "Entwickelt von Theolddispatch & The40n8  ·  ausführbare Version  ·  v{v}",
-    "it": "Sviluppato da Theolddispatch & The40n8  ·  versione eseguibile  ·  v{v}",
-    "pt": "Desenvolvido por Theolddispatch & The40n8  ·  versão executável  ·  v{v}",
-    "ja": "Theolddispatch & The40n8 制作  ·  実行可能バージョン  ·  v{v}",
+    "de": "Ausführbare Version  ·  v{v}",
+    "it": "Versione eseguibile  ·  v{v}",
+    "pt": "Versão executável  ·  v{v}",
+    "ja": "実行可能バージョン  ·  v{v}",
 }
 _OVERRIDES = {
     "de": dict(btn_clear="Log leeren",    btn_history="Upload-Verlauf",    btn_save="KONFIGURATION SPEICHERN",
@@ -2716,7 +3567,7 @@ _OVERRIDES = {
                lbl_notify_interval="Intervalo :"),
     "ja": dict(
         title="BLACK FLAG v{v}",
-        subtitle="Theolddispatch & The40n8 制作  ·  実行可能バージョン  ·  v{v}",
+        subtitle="実行可能バージョン  ·  v{v}",
         log_header="  ログ",
         btn_clear="ログ消去",
         btn_history="アップロード履歴",
@@ -2761,7 +3612,7 @@ _OVERRIDES = {
         lbl_notify_interval="確認間隔 :",
         notify_hint="サイトがダウン時に自動有効",
         tip_qb_url="例: http://192.168.1.x:8080",
-        tip_qb_path="NAS上のLinuxパス",
+        tip_qb_path="qBittorrentがローカルで認識するファイルパス。\n(通常、最初の2つのフィールドと同じで \\. 形式。)\nNAS/サーバーの場合、コンテナによって異なる — 親フォルダを / で複製するだけ\n(例: /Movies/Movies)",
         btn_qb_fetch="↺ 取得",
         tmdb_link="無料キー取得 → themoviedb.org/settings/api",
         hist_title="アップロード履歴",
@@ -2785,6 +3636,34 @@ _OVERRIDES = {
         log_series="   シリーズ : {d}  (最大 {m})",
         log_saved="設定を保存しました。",
         log_stop="■  停止をリクエストしました...",
+        btn_autosave_on="⏺ Autosave ON",
+        btn_autosave_off="⏹ Autosave OFF",
+        btn_clear_cfg="設定を消去",
+        confirm_clear_cfg="保存された設定をすべて消去しますか？",
+        conn_api="API",
+        conn_web="Web",
+        lbl_conn_mode="接続モード :",
+        lbl_passkey="API Passkey :",
+        lbl_passkey_hint="la-cale.space/settings/api-keys",
+        lbl_save_logs="ログ保存 :",
+        lbl_save_curl="curlファイル生成 :",
+        save_logs_on="有効",
+        save_logs_off="無効",
+        save_curl_on="有効",
+        save_curl_off="無効",
+        lbl_check_updates="アップデート確認 :",
+        check_updates_on="有効",
+        check_updates_off="無効",
+        lbl_seed_check="シード確認 QB :",
+        seed_check_on="必須",
+        seed_check_off="無効",
+        lbl_update_available="アップデートあり",
+        lbl_tr_url="WebUI URL :",
+        lbl_tr_user="ユーザー名 :",
+        lbl_tr_pass="パスワード :",
+        lbl_tr_films="映画保存先 :",
+        lbl_tr_series="シリーズ保存先 :",
+        tip_tr_url="例: http://192.168.1.x:9091",
     ),
 }
 for _lc, _sub in _SUBTITLES.items():
@@ -3001,6 +3880,14 @@ class App:
         self.root    = root
         self.root.configure(bg=C["bg"])
         self.root.resizable(True, True)
+
+        # ── Mot de passe maître SYNCHRONE avant tout le reste ────────────────
+        # On demande le mot de passe AVANT load_cfg(), _build(), _load() etc.
+        # pour que toute la session soit correctement chiffrée dès le départ.
+        if _CRYPTO_OK:
+            self._ask_master_password_sync()
+
+        # Charger la config APRÈS avoir le mot de passe
         self.cfg     = load_cfg()
         self.worker  = None
         self.running = False
@@ -3017,7 +3904,9 @@ class App:
         self._save_logs_enabled = bool(self.cfg.get("save_logs", False))
         self._save_curl_enabled = bool(self.cfg.get("save_curl", False))
         self._check_updates_enabled = bool(self.cfg.get("check_updates", True))
-        self._seed_check_enabled = bool(self.cfg.get("seed_check", True))
+        self._seed_check_enabled    = bool(self.cfg.get("seed_check", True))
+        self._encrypt_cfg_enabled   = bool(self.cfg.get("encrypt_cfg", True))
+        self._torrent_client        = self.cfg.get("torrent_client", "qbittorrent")
 
         # Fix combos invisibles sur Windows : forcer foreground sur les combobox
         # Le thème "clam" ne répercute pas correctement foreground en mode readonly
@@ -3035,6 +3924,12 @@ class App:
                 -foreground {C['ifg']}
         """)
 
+        # Thème UI (appliqué avant le build pour que les widgets naissent avec les bonnes couleurs)
+        _saved_theme = self.cfg.get("ui_theme", "gold")
+        if _saved_theme in THEMES:
+            _current_theme[0] = _saved_theme
+            C.update(THEMES[_saved_theme])
+
         # Langue UI (chargée depuis config, défaut fr)
         global _lang
         _lang = self.cfg.get("ui_lang", "fr")
@@ -3050,6 +3945,222 @@ class App:
         self._apply_lang()   # applique les textes dans la bonne langue
         if not _REQUESTS_OK:
             self.root.after(400, self._ask_requests)
+
+    def _ask_master_password_sync(self):
+        """
+        Popup synchrone mot de passe - bloque avant load_cfg.
+        En cas de mauvais mot de passe : affiche l'erreur dans la dialog
+        et redemande — ne sort JAMAIS silencieusement vers une session vierge.
+        Seul le bouton explicite "Session sans chiffrement" permet de bypasser.
+        """
+        import tkinter as _tk
+        first_launch = not CONFIG_ENC_FILE.exists()
+
+        self.root.withdraw()
+
+        while True:
+            # ── Construire la dialog ──────────────────────────────────────────
+            dlg = _tk.Toplevel(self.root)
+            dlg.title("BLACK FLAG - Creer un mot de passe" if first_launch
+                      else "BLACK FLAG - Mot de passe requis")
+            dlg.configure(bg=C["bg"])
+            dlg.resizable(False, False)
+            dlg.update_idletasks()
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            h  = 230 if first_launch else 200
+            dlg.geometry(f"440x{h}+{(sw-440)//2}+{(sh-h)//2}")
+            dlg.grab_set()
+            dlg.lift()
+            dlg.focus_force()
+
+            _result = [None]   # None = skip, str = mot de passe
+
+            if first_launch:
+                lbl_title = "Creation du mot de passe maitre"
+                lbl_hint  = "Ce mot de passe protege votre configuration.\nChoisissez-le bien - impossible a recuperer."
+            else:
+                lbl_title = "Config chiffree - Mot de passe requis"
+                lbl_hint  = "Entrez votre mot de passe maitre\npour dechiffrer la configuration BLACK FLAG."
+
+            _tk.Label(dlg, text=lbl_title, font=FB,
+                      bg=C["bg"], fg=C["gold"]).pack(pady=(14, 2))
+            _tk.Label(dlg, text=lbl_hint, font=FM8,
+                      bg=C["bg"], fg=C["muted"], justify="center").pack(pady=(0, 8))
+
+            frame_e = _tk.Frame(dlg, bg=C["bg"])
+            frame_e.pack()
+
+            _tk.Label(frame_e, text="Mot de passe :", font=FL,
+                      bg=C["bg"], fg=C["text"]).grid(row=0, column=0, padx=(0, 6), pady=3)
+            e1 = _tk.Entry(frame_e, show="*", font=FM, width=24,
+                           bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                           relief="flat", highlightthickness=1,
+                           highlightbackground=C["border"])
+            e1.grid(row=0, column=1, pady=3)
+            e1.focus_set()
+
+            e2 = None
+            if first_launch:
+                _tk.Label(frame_e, text="Confirmer :", font=FL,
+                          bg=C["bg"], fg=C["text"]).grid(row=1, column=0, padx=(0, 6), pady=3)
+                e2 = _tk.Entry(frame_e, show="*", font=FM, width=24,
+                               bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                               relief="flat", highlightthickness=1,
+                               highlightbackground=C["border"])
+                e2.grid(row=1, column=1, pady=3)
+
+            lbl_err = _tk.Label(dlg, text="", font=FM8, bg=C["bg"], fg=C["red"])
+            lbl_err.pack()
+
+            def _validate(e1=e1, e2=e2, result=_result, err=lbl_err, d=dlg):
+                pw = e1.get()
+                if not pw:
+                    err.config(text="Le mot de passe ne peut pas etre vide.")
+                    return
+                if e2 is not None and pw != e2.get():
+                    err.config(text="Les mots de passe ne correspondent pas.")
+                    return
+                result[0] = pw
+                d.destroy()
+
+            def _skip(result=_result, d=dlg):
+                result[0] = None
+                d.destroy()
+
+            bf = _tk.Frame(dlg, bg=C["bg"])
+            bf.pack(pady=8)
+            _tk.Button(bf, text="Valider", font=FB,
+                       bg=C["panel"], fg=C["gold"], relief="flat",
+                       padx=16, cursor="hand2",
+                       command=_validate).pack(side="left", padx=8)
+            _tk.Button(bf, text="Session sans chiffrement", font=FL,
+                       bg=C["panel"], fg=C["muted"], relief="flat",
+                       padx=8, cursor="hand2",
+                       command=_skip).pack(side="left", padx=8)
+
+            dlg.bind("<Return>", lambda e, v=_validate: v())
+            dlg.bind("<Escape>", lambda e, s=_skip: s())
+            dlg.protocol("WM_DELETE_WINDOW", _skip)
+
+            self.root.wait_window(dlg)
+
+            pw = _result[0]
+
+            # ── Utilisateur a cliqué "Session sans chiffrement" ───────────────
+            if pw is None:
+                self._encrypt_cfg_enabled = False
+                _SESSION_MASTER_PW[0] = None
+                break   # sortie explicite de la boucle
+
+            # ── Premier lancement : créer le mot de passe ─────────────────────
+            if first_launch:
+                _SESSION_MASTER_PW[0] = pw
+                self._encrypt_cfg_enabled = True
+                existing = load_cfg()
+                existing["encrypt_cfg"] = True
+                save_cfg(existing)
+                if CONFIG_FILE.exists():
+                    try:
+                        CONFIG_FILE.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                break   # mot de passe créé, on continue
+
+            # ── Lancement suivant : vérifier le déchiffrement ─────────────────
+            _SESSION_MASTER_PW[0] = pw
+            test = _decrypt_cfg(CONFIG_ENC_FILE.read_bytes())
+            if test is not None:
+                # Succès
+                self._encrypt_cfg_enabled = True
+                break   # sortie de boucle, on continue le chargement
+            else:
+                # Mauvais mot de passe → afficher erreur et REBOUCLER
+                _SESSION_MASTER_PW[0] = None
+                import tkinter.messagebox as _mb
+                retry = _mb.askretrycancel(
+                    "Mot de passe incorrect",
+                    "Le mot de passe est incorrect.\n\n"
+                    "Réessayer ? (Annuler = session sans chiffrement)",
+                    parent=self.root)
+                if not retry:
+                    # L'utilisateur renonce explicitement
+                    self._encrypt_cfg_enabled = False
+                    _SESSION_MASTER_PW[0] = None
+                    break
+                # Sinon on reboucle automatiquement
+
+        # Réafficher la fenêtre principale dans tous les cas
+        self.root.deiconify()
+
+    def _prompt_master_password_on_start(self):
+        """
+        Appelee au lancement si crypto disponible.
+        - Premier lancement (pas de .enc) : migre l'eventuelle config JSON en
+          config chiffree, puis cree le mot de passe (confirm=True).
+        - Lancements suivants (.enc existe) : demande le mot de passe et
+          recharge la config dechiffree sans declencher les callbacks.
+        - Annulation : session sans chiffrement (config JSON clair).
+        """
+        first_launch = not CONFIG_ENC_FILE.exists()
+
+        if first_launch:
+            # ── Premier lancement ─────────────────────────────────────────────
+            pw = self._ask_master_password(
+                confirm=True,
+                title="Creer un mot de passe maitre — Protection de la config")
+            if pw is None:
+                self._encrypt_cfg_enabled = False
+                self._log("  Chiffrement : annule — config en clair pour cette session.", "err")
+                self._log("  Activez-le dans Parametres > Divers pour proteger vos donnees.", "muted")
+                return
+            _SESSION_MASTER_PW[0] = pw
+            self._encrypt_cfg_enabled = True
+            # Migrer la config actuelle (JSON clair ou DEFAULTS) vers .enc
+            # self.cfg a deja ete charge depuis le .json si il existait
+            self.cfg["encrypt_cfg"] = True
+            save_cfg(self.cfg)
+            # Supprimer le .json clair s'il existe encore
+            if CONFIG_FILE.exists():
+                try:
+                    CONFIG_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self._log("  Mot de passe maitre cree — config migree et chiffree ✓", "ok")
+            if CONFIG_FILE.exists():
+                self._log("  Ancien fichier .json supprime ✓", "ok")
+        else:
+            # ── Lancements suivants ───────────────────────────────────────────
+            pw = self._ask_master_password(
+                confirm=False,
+                title="Config chiffree — Mot de passe requis")
+            if pw is None:
+                self._encrypt_cfg_enabled = False
+                _SESSION_MASTER_PW[0] = None
+                self._log("  Mot de passe annule — config par defaut chargee.", "err")
+                return
+            _SESSION_MASTER_PW[0] = pw
+            self._encrypt_cfg_enabled = True
+            # Dechiffrer la config — bloquer les callbacks pendant le rechargement
+            new_cfg = load_cfg()
+            if new_cfg.get("encrypt_cfg") or new_cfg != dict(DEFAULTS):
+                # Rechargement reussi : repeupler l'UI sans declencher autosave
+                self._loading = True
+                self.cfg = new_cfg
+                try:
+                    self._load()
+                finally:
+                    self._loading = False
+                self._log("  Config chiffree chargee ✓", "ok")
+            else:
+                # Dechiffrement echoue → mauvais mot de passe
+                _SESSION_MASTER_PW[0] = None
+                self._encrypt_cfg_enabled = False
+                messagebox.showerror(
+                    "Mot de passe incorrect",
+                    "Impossible de dechiffrer la config.\n"
+                    "Verifiez le mot de passe ou supprimez .blackflag_config.enc\n"
+                    "pour repartir d'une config vierge.")
 
     def _center(self):
         self.root.update_idletasks()
@@ -3184,7 +4295,8 @@ class App:
         self.log_box.configure(yscrollcommand=_log_vsb.set)
 
         for tag, col in [("ok", C["green"]), ("err", C["red"]),
-                         ("gold", C["gold"]), ("muted", C["muted"])]:
+                         ("gold", C["gold"]), ("muted", C["muted"]),
+                         ("dup", C["cyan"])]:
             self.log_box.tag_config(tag, foreground=col)
         self.log_box.bind("<Button-1>", lambda e: self.log_box.config(state="normal") or
                           self.log_box.after(0, lambda: self.log_box.config(state="disabled")))
@@ -3336,17 +4448,24 @@ class App:
                   command=lambda: self._browse("films_dir")
                   ).grid(row=1, column=2, sticky="w", padx=(0, 6))
 
-        lbl_grade = tk.Label(outer, text="", font=FL, bg=C["bg"], fg=C["muted"],
-                             anchor="w")
-        lbl_grade.grid(row=1, column=3, sticky="w", padx=(8, 4))
-        self._dyn_labels["grade_lbl"] = (lbl_grade, "grade")
+        # Grade Films
+        lbl_grade_f = tk.Label(outer, text="Grade :", font=FL, bg=C["bg"], fg=C["muted"], anchor="w")
+        lbl_grade_f.grid(row=1, column=3, sticky="w", padx=(8, 4))
 
         self.grade_film_var = tk.StringVar()
-        self._grade_combo = self._make_combo_widget(outer, self.grade_film_var, get_grades(), width=22)
-        self._grade_combo.grid(row=1, column=4, sticky="w", padx=(0, 4))
+        self._grade_f_combo = self._make_combo_widget(outer, self.grade_film_var, get_grades(), width=22)
+        self._grade_f_combo.grid(row=1, column=4, sticky="w", padx=(0, 4))
         self.grade_film_var.trace_add("write", self._on_grade_film)
 
-        # ── Ligne Séries : chemin + […] + "Max uploads :" + champ valeur ──────
+        # Max Films (indépendant)
+        self.vars["max_movies"] = tk.StringVar()
+        tk.Entry(outer, textvariable=self.vars["max_movies"],
+                 font=FM, bg=C["ibg"], fg=C["ifg"],
+                 insertbackground=C["gold"], relief="flat", bd=0,
+                 highlightthickness=1, highlightbackground=C["border"], width=5
+                 ).grid(row=1, column=5, sticky="w", padx=(0, 4))
+
+        # ── Ligne Séries : chemin + […] + grade + max ────────────────────────
         lbl_series = tk.Label(outer, text="", font=FB, bg=C["bg"],
                               fg=C["gold"], anchor="w", width=10)
         lbl_series.grid(row=2, column=0, sticky="w", padx=(8, 0), pady=3)
@@ -3364,18 +4483,21 @@ class App:
                   command=lambda: self._browse("series_dir")
                   ).grid(row=2, column=2, sticky="w", padx=(0, 6))
 
-        lbl_max = tk.Label(outer, text="", font=FL, bg=C["bg"], fg=C["muted"],
-                           anchor="w")
-        lbl_max.grid(row=2, column=3, sticky="w", padx=(8, 4))
-        self._dyn_labels["max_uploads_lbl"] = (lbl_max, "max_uploads")
+        # Grade Séries (indépendant)
+        lbl_grade_s = tk.Label(outer, text="Grade :", font=FL, bg=C["bg"], fg=C["muted"], anchor="w")
+        lbl_grade_s.grid(row=2, column=3, sticky="w", padx=(8, 4))
+        self.grade_series_var = tk.StringVar()
+        self._grade_s_combo = self._make_combo_widget(outer, self.grade_series_var, get_grades(), width=22)
+        self._grade_s_combo.grid(row=2, column=4, sticky="w", padx=(0, 4))
+        self.grade_series_var.trace_add("write", self._on_grade_series)
 
-        self.vars["max_movies"] = tk.StringVar()
-        self.vars["max_series"] = self.vars["max_movies"]
-        tk.Entry(outer, textvariable=self.vars["max_movies"],
+        # Max Séries (indépendant)
+        self.vars["max_series"] = tk.StringVar()
+        tk.Entry(outer, textvariable=self.vars["max_series"],
                  font=FM, bg=C["ibg"], fg=C["ifg"],
                  insertbackground=C["gold"], relief="flat", bd=0,
                  highlightthickness=1, highlightbackground=C["border"], width=5
-                 ).grid(row=2, column=4, sticky="w", padx=(0, 4))
+                 ).grid(row=2, column=5, sticky="w", padx=(0, 4))
 
         # ── Panneau paramètres avec Canvas scrollable ─────────────────────────
         self._settings_outer = tk.Frame(outer, bg=C["bg"])
@@ -3565,16 +4687,33 @@ class App:
 
         r = 0
 
-        # ── Langue interface (en premier) ─────────────────────────────────────
+        # ── Langue interface + Thème interface (même ligne) ─────────────────
         lbl_ul = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
                            anchor="w", width=24)
         lbl_ul.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=(6, 4))
         self._s_labels["row_lbl_ui_lang"] = (lbl_ul, "lbl_ui_lang")
+
+        # Frame inline colonne 1 : combo langue + label thème + combo thème collés
+        _lang_theme_frame = tk.Frame(p, bg=C["bg"])
+        _lang_theme_frame.grid(row=r, column=1, sticky="w", pady=(6, 4))
+
         self.vars["ui_lang"] = tk.StringVar()
         self._ui_lang_combo = self._make_combo_widget(
-            p, self.vars["ui_lang"], list(LANGS_UI.keys()), width=10)
-        self._ui_lang_combo.grid(row=r, column=1, sticky="w", padx=4, pady=(6, 4))
+            _lang_theme_frame, self.vars["ui_lang"], list(LANGS_UI.keys()), width=10)
+        self._ui_lang_combo.pack(side="left", padx=(4, 0))
         self.vars["ui_lang"].trace_add("write", self._on_ui_lang_change)
+
+        # Label thème — texte fixe, pas dans _s_labels (pas de traduction)
+        tk.Label(_lang_theme_frame, text="     Thème d'interface :", font=FL,
+                 bg=C["bg"], fg=C["muted"]).pack(side="left")
+
+        # Combo thème — collé au label
+        self.vars["ui_theme"] = tk.StringVar()
+        self._ui_theme_combo = self._make_combo_widget(
+            _lang_theme_frame, self.vars["ui_theme"],
+            list(THEME_NAMES.values()), width=14)
+        self._ui_theme_combo.pack(side="left", padx=(4, 0))
+        self.vars["ui_theme"].trace_add("write", self._on_ui_theme_change)
         r += 1
 
         # ── Section tracker : LA CALE ↔ TORR9 ───────────────────────────────
@@ -3717,6 +4856,27 @@ class App:
                       placeholder="https://torr9.net/upload")
         r = torr9_row(r, "Pseudonyme :",   "torr9_user", w=30)
         r = torr9_row(r, "Mot de passe :", "torr9_pass", show="*", w=24)
+
+        # ── Champ Token API + bouton Récupérer ───────────────────────────────
+        lbl_tok = tk.Label(p, text="Token API :", font=FL, bg=C["bg"],
+                           fg=C["muted"], anchor="w", width=24)
+        lbl_tok.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+        self.vars["torr9_token"] = tk.StringVar()
+        tok_entry = tk.Entry(p, textvariable=self.vars["torr9_token"],
+                             font=FM,
+                             bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                             relief="flat", bd=0, highlightthickness=1,
+                             highlightbackground=C["border"], width=36)
+        tok_entry.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+        self._btn_torr9_token = tk.Button(
+            p, text="↺ Récupérer", font=FM8,
+            bg=C["panel"], fg=C["gold_dim"],
+            relief="flat", bd=0, padx=6, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["border"],
+            command=self._fetch_torr9_token)
+        self._btn_torr9_token.grid(row=r, column=2, sticky="w", padx=(0, 4), pady=1)
+        self._torr9_rows.extend([lbl_tok, tok_entry, self._btn_torr9_token])
+        r += 1
 
         # ── Champ URL de publication + bouton Récupérer ───────────────────────
         lbl_ann = tk.Label(p, text="URL de publication :", font=FL, bg=C["bg"],
@@ -3896,6 +5056,18 @@ class App:
             cursor="hand2", command=lambda: self._set_torrent_client("transmission"))
         self._btn_client_tr.pack(side="left", padx=(4, 0))
 
+        self._btn_client_de = tk.Button(
+            hdr_frame, text="DELUGE", font=FB,
+            bg=C["panel"], relief="flat", bd=0, padx=10, pady=3,
+            cursor="hand2", command=lambda: self._set_torrent_client("deluge"))
+        self._btn_client_de.pack(side="left", padx=(4, 0))
+
+        self._btn_client_vz = tk.Button(
+            hdr_frame, text="VUZE", font=FB,
+            bg=C["panel"], relief="flat", bd=0, padx=10, pady=3,
+            cursor="hand2", command=lambda: self._set_torrent_client("vuze"))
+        self._btn_client_vz.pack(side="left", padx=(4, 0))
+
         tk.Frame(p, bg=C["gold_dim"], height=1).grid(
             row=r, column=0, columnspan=4, sticky="ew", pady=(0, 3))
         r += 1
@@ -3976,6 +5148,61 @@ class App:
         r = tr_row(r, "lbl_tr_films",  "tr_films_path", w=30)
         r = tr_row(r, "lbl_tr_series", "tr_series_path", w=30)
 
+        # ── Champs DELUGE ────────────────────────────────────────────────
+        self._de_rows = []
+
+        def de_row(r, label_txt, cfg_key, show=None, w=36, tip_txt=None):
+            lbl = tk.Label(p, text=label_txt, font=FL, bg=C["bg"],
+                           fg=C["muted"], anchor="w", width=24)
+            lbl.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+            var = tk.StringVar(); self.vars[cfg_key] = var
+            e = tk.Entry(p, textvariable=var, font=FM, show=show or "",
+                         bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                         relief="flat", bd=0, highlightthickness=1,
+                         highlightbackground=C["border"], width=w)
+            e.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+            self._de_rows.extend([lbl, e])
+            if tip_txt:
+                tip = tk.Label(p, text=tip_txt, font=FM8, bg=C["bg"], fg=C["muted"])
+                tip.grid(row=r, column=2, sticky="w")
+                self._de_rows.append(tip)
+            return r + 1
+
+        r = de_row(r, "URL Deluge :",        "deluge_url",          w=32,
+                   tip_txt="ex: http://192.168.1.x:8112")
+        r = de_row(r, "Mot de passe :",      "deluge_pass",         show="*", w=20)
+        r = de_row(r, "Save path Films :",   "deluge_films_path",   w=30)
+        r = de_row(r, "Save path Séries :",  "deluge_series_path",  w=30)
+
+        # ── Champs VUZE ──────────────────────────────────────────────────
+        self._vz_rows = []
+
+        def vz_row(r, label_txt, cfg_key, show=None, w=36, tip_txt=None):
+            lbl = tk.Label(p, text=label_txt, font=FL, bg=C["bg"],
+                           fg=C["muted"], anchor="w", width=24)
+            lbl.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=1)
+            var = tk.StringVar(); self.vars[cfg_key] = var
+            e = tk.Entry(p, textvariable=var, font=FM, show=show or "",
+                         bg=C["ibg"], fg=C["ifg"], insertbackground=C["gold"],
+                         relief="flat", bd=0, highlightthickness=1,
+                         highlightbackground=C["border"], width=w)
+            e.grid(row=r, column=1, sticky="ew", padx=4, pady=1)
+            self._vz_rows.extend([lbl, e])
+            if tip_txt:
+                tip = tk.Label(p, text=tip_txt, font=FM8, bg=C["bg"], fg=C["muted"])
+                tip.grid(row=r, column=2, sticky="w")
+                self._vz_rows.append(tip)
+            return r + 1
+
+        r = vz_row(r, "URL Vuze :",          "vuze_url",         w=32,
+                   tip_txt="ex: http://192.168.1.x:9091")
+        r = vz_row(r, "Utilisateur :",       "vuze_user",        w=16,
+                   tip_txt="'vuze' par defaut")
+        r = vz_row(r, "Code de pairing :",   "vuze_pass",        show="*", w=24,
+                   tip_txt="Affiché dans le plugin Vuze Web Remote")
+        r = vz_row(r, "Save path Films :",   "vuze_films_path",  w=30)
+        r = vz_row(r, "Save path Series :",  "vuze_series_path", w=30)
+
         # Appliquer la visibilité initiale
         p.after(15, self._update_client_ui)
 
@@ -4027,6 +5254,29 @@ class App:
 
         # Appliquer l'état visuel initial des toggles
         p.after(25, self._refresh_logs_curl_ui)
+
+        # ── Chiffrement de la configuration ──────────────────────────────────
+        lbl_enc = tk.Label(p, text="Chiffrement config :", font=FL,
+                           bg=C["bg"], fg=C["muted"], anchor="w", width=24)
+        lbl_enc.grid(row=r, column=0, sticky="w", padx=(8, 0), pady=(6, 2))
+
+        enc_row = tk.Frame(p, bg=C["bg"])
+        enc_row.grid(row=r, column=1, columnspan=3, sticky="w", pady=(6, 2))
+
+        self._encrypt_cfg_enabled = bool(self.cfg.get("encrypt_cfg", True))
+        self._btn_encrypt_cfg = tk.Button(
+            enc_row, text="", font=FB,
+            bg=C["panel"], relief="flat", bd=0, padx=8, pady=3,
+            cursor="hand2", command=self._toggle_encrypt_cfg)
+        self._btn_encrypt_cfg.pack(side="left")
+
+        _enc_hint = "  (AES-256 via Fernet/PBKDF2 — mot de passe saisi au lancement)"
+        if not _CRYPTO_OK:
+            _enc_hint = "  ⚠ cryptography non installé — chiffrement indisponible"
+        tk.Label(enc_row, text=_enc_hint, font=FM8,
+                 bg=C["bg"], fg=C["muted"]).pack(side="left")
+        r += 1
+        p.after(30, self._refresh_encrypt_cfg_ui)
 
         # ── Notification HTTP 200 ─────────────────────────────────────────
         lbl_n = tk.Label(p, text="", font=FL, bg=C["bg"], fg=C["muted"],
@@ -4102,6 +5352,31 @@ class App:
 
         p.after(30, self._refresh_check_updates_ui)
         r += 1
+
+        # ── Mise à jour automatique depuis GitHub (visible seulement si MAJ dispo) ─
+        self._upd_sep = tk.Frame(p, bg=C["gold_dim"], height=1)
+        self._upd_sep.grid(row=r, column=0, columnspan=4, sticky="ew", pady=(10, 6))
+        r += 1
+
+        self._upd_frame = tk.Frame(p, bg=C["bg"])
+        self._upd_frame.grid(row=r, column=0, columnspan=4, sticky="w",
+                              padx=(8, 0), pady=(0, 10))
+
+        self._btn_self_update = tk.Button(
+            self._upd_frame, text="⬇  Installer la dernière version (GitHub)", font=FB,
+            bg=C["panel"], fg=C["gold"], relief="flat", bd=0,
+            padx=12, pady=5, cursor="hand2",
+            highlightthickness=1, highlightbackground=C["gold_dim"],
+            command=self._self_update)
+        self._btn_self_update.pack(side="left")
+
+        tk.Label(self._upd_frame,
+                 text="  Remplace le fichier .py courant puis relancez.",
+                 font=FM8, bg=C["bg"], fg=C["muted"]).pack(side="left")
+        r += 1
+
+        # Masqué par défaut — affiché par _show_update_badge si MAJ détectée
+        p.after(10, self._hide_update_install_btn)
 
     # ── Barre du bas ──────────────────────────────────────────────────────────
     def _build_bottom(self):
@@ -4201,6 +5476,148 @@ class App:
     # ══════════════════════════════════════════════════════════════════════════
     # LANGUE — application dynamique
     # ══════════════════════════════════════════════════════════════════════════
+    def _on_ui_theme_change(self, *_):
+        """Appelée quand l'utilisateur change de thème dans le combo."""
+        label = self.vars["ui_theme"].get().strip()
+        # Retrouver la clé interne depuis le label affiché
+        key = next((k for k, v in THEME_NAMES.items() if v == label), None)
+        if key and key != _current_theme[0]:
+            self._apply_theme(key)
+            cfg = self._collect()
+            cfg["ui_theme"] = key
+            save_cfg(cfg); self.cfg = cfg
+            theme_label = THEME_NAMES.get(key, key)
+            self._log(f"  Thème changé : {theme_label}", "ok")
+            self._log("  Relancez BLACK FLAG !", "ok")
+
+    def _apply_theme(self, theme_key: str):
+        """
+        Change le thème en cours :
+        1. Met à jour le dict global C avec la nouvelle palette.
+        2. Parcourt récursivement tous les widgets et reconfigure les couleurs.
+        3. Reapplique le style ttk (Combobox) avec les nouvelles couleurs.
+        """
+        if theme_key not in THEMES:
+            return
+        _current_theme[0] = theme_key
+        palette = THEMES[theme_key]
+        C.update(palette)
+
+        def _recolor(widget):
+            """Reconfigure récursivement les couleurs d'un widget."""
+            cls = widget.winfo_class()
+            try:
+                kw = {}
+                # Fond général
+                if cls in ("Frame", "Label", "Toplevel"):
+                    kw["bg"] = C["bg"]
+                elif cls == "Button":
+                    cur_fg = widget.cget("fg")
+                    # Conserver la couleur sémantique : or/vert/rouge/gris
+                    if cur_fg in ("#eab308", "#7a5c00",  # gold thème précédent
+                                  "#38bdf8", "#1e5f8a"):  # gold thème bleu
+                        kw["fg"] = C["gold"]
+                    elif cur_fg in ("#22c55e",):
+                        kw["fg"] = C["green"]
+                    elif cur_fg in ("#ef4444",):
+                        kw["fg"] = C["red"]
+                    else:
+                        kw["fg"] = C["muted"]
+                    kw["bg"]                  = C["panel"]
+                    kw["highlightbackground"] = C["border"]
+                    kw["activebackground"]    = C["border"]
+                    kw["activeforeground"]    = C["gold"]
+                elif cls == "Entry":
+                    kw["bg"]              = C["ibg"]
+                    kw["fg"]              = C["ifg"]
+                    kw["insertbackground"]= C["gold"]
+                    kw["highlightbackground"] = C["border"]
+                elif cls == "Text":
+                    kw["bg"] = C["ibg"]
+                    kw["fg"] = C["ifg"]
+                    kw["insertbackground"] = C["gold"]
+                    # Retags log
+                    try:
+                        widget.tag_config("gold",  foreground=C["gold"])
+                        widget.tag_config("ok",    foreground=C["green"])
+                        widget.tag_config("err",   foreground=C["red"])
+                        widget.tag_config("muted", foreground=C["muted"])
+                        widget.tag_config("dup",   foreground=C["cyan"])
+                    except Exception:
+                        pass
+                elif cls == "Canvas":
+                    kw["bg"] = C["bg"]
+                if kw:
+                    widget.config(**kw)
+            except Exception:
+                pass
+            # Récursion sur les enfants
+            for child in widget.winfo_children():
+                _recolor(child)
+
+        _recolor(self.root)
+
+        # ── Barre de progression ─────────────────────────────────────────────
+        try:
+            st = ttk.Style()
+            st.configure("BF.Horizontal.TProgressbar",
+                         troughcolor=C["panel"],
+                         background=C["gold"],
+                         bordercolor=C["border"])
+        except Exception:
+            pass
+
+        # ── Combobox style ───────────────────────────────────────────────────
+        try:
+            st = ttk.Style()
+            st.configure("BF.TCombobox",
+                         fieldbackground=C["ibg"], background=C["ibg"],
+                         foreground=C["ifg"], selectbackground=C["ibg"],
+                         selectforeground=C["gold"],
+                         bordercolor=C["border"],
+                         lightcolor=C["border"], darkcolor=C["border"],
+                         arrowcolor=C["gold"], insertcolor=C["ifg"])
+            st.map("BF.TCombobox",
+                   fieldbackground=[("readonly", C["ibg"])],
+                   foreground=[("readonly", C["ifg"]), ("disabled", C["muted"])],
+                   selectbackground=[("readonly", C["ibg"])],
+                   selectforeground=[("readonly", C["gold"])],
+                   bordercolor=[("readonly", C["border"]), ("focus", C["border"])],
+                   lightcolor=[("readonly", C["border"]), ("focus", C["border"])],
+                   darkcolor=[("readonly", C["border"]), ("focus", C["border"])])
+            self.root.option_add("*TCombobox*Listbox.foreground",   C["ifg"])
+            self.root.option_add("*TCombobox*Listbox.background",   C["ibg"])
+            self.root.option_add("*TCombobox*Listbox.selectForeground", C["gold"])
+            self.root.option_add("*TCombobox*Listbox.selectBackground", C["border"])
+        except Exception:
+            pass
+
+        # ── Séparateurs (Frame height=1) — recolorer en gold_dim ────────────
+        # On cherche les Frame de hauteur 1 (séparateurs) dans le panneau settings
+        def _recolor_separators(widget):
+            try:
+                if (widget.winfo_class() == "Frame"
+                        and widget.winfo_height() <= 2
+                        and widget.cget("bg") not in (C["bg"], C["panel"])):
+                    widget.config(bg=C["gold_dim"])
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                _recolor_separators(child)
+        self.root.after(50, lambda: _recolor_separators(self.root))
+
+        # ── Titre fenêtre barre sombre (Windows) ─────────────────────────────
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
+        except Exception:
+            pass
+
+        # Forcer un rafraîchissement visuel
+        self.root.update_idletasks()
+
     def _on_ui_lang_change(self, *_):
         global _lang
         new = self.vars["ui_lang"].get().strip()
@@ -4273,17 +5690,27 @@ class App:
         # Combo langue UI
         self._ui_lang_combo.config(values=list(LANGS_UI.keys()))
 
-        # Combo grade — mettre à jour les valeurs dans la langue courante
-        if hasattr(self, "_grade_combo"):
+        # Combo grade Films — mettre à jour les valeurs dans la langue courante
+        if hasattr(self, "_grade_f_combo"):
             grades = get_grades()
-            self._grade_combo.config(values=grades)
-            # Préserver la valeur sélectionnée (par index dans GRADE_MAX)
+            self._grade_f_combo.config(values=grades)
             try:
                 max_val = int(self.vars["max_movies"].get() or 1)
                 idx = GRADE_MAX.index(max_val)
                 self.grade_film_var.set(grades[idx])
             except (ValueError, IndexError):
                 self.grade_film_var.set(grades[0])
+
+        # Combo grade Séries — mettre à jour les valeurs dans la langue courante
+        if hasattr(self, "_grade_s_combo"):
+            grades = get_grades()
+            self._grade_s_combo.config(values=grades)
+            try:
+                max_val = int(self.vars["max_series"].get() or 1)
+                idx = GRADE_MAX.index(max_val)
+                self.grade_series_var.set(grades[idx])
+            except (ValueError, IndexError):
+                self.grade_series_var.set(grades[0])
 
     # ══════════════════════════════════════════════════════════════════════════
     # FENÊTRE HISTORIQUE
@@ -4393,7 +5820,7 @@ class App:
         def get_seed_state(title):
             try:
                 cfg_local   = self.cfg
-                if cfg_local.get("torrent_client", "qbittorrent") == "transmission":
+                if cfg_local.get("torrent_client", "qbittorrent") != "qbittorrent":
                     return ""
                 url  = cfg_local.get("qb_url", "").strip()
                 user = cfg_local.get("qb_user", "").strip()
@@ -4580,7 +6007,11 @@ class App:
         except (ValueError, IndexError): pass
 
     def _on_grade_series(self, *_):
-        pass  # plus utilisé — max_series = max_movies
+        try:
+            idx = get_grades().index(self.grade_series_var.get())
+            self.vars["max_series"].set(str(GRADE_MAX[idx]))
+        except (ValueError, IndexError):
+            pass
 
     def _fetch_torr9_announce(self):
         """Récupère l'URL d'annonce Torr9 depuis le passkey utilisateur."""
@@ -4636,6 +6067,53 @@ class App:
         if result:
             self.vars["torr9_announce"].set(result)
             self._log(f"Torr9 → URL d'annonce récupérée.", "ok")
+
+    def _fetch_torr9_token(self):
+        """Récupère le token API Torr9 depuis le login user/pass et le stocke."""
+        user = self.vars.get("torr9_user", tk.StringVar()).get().strip()
+        pwd  = self.vars.get("torr9_pass", tk.StringVar()).get().strip()
+
+        if not user or not pwd:
+            messagebox.showwarning("Torr9",
+                "Renseignez d'abord le pseudonyme et le mot de passe Torr9.")
+            return
+
+        self._btn_torr9_token.config(state="disabled", text="...")
+
+        def _do():
+            result = None
+            error  = None
+            try:
+                import requests as _req
+                r = _req.post(
+                    "https://api.torr9.net/api/v1/auth/login",
+                    json={"username": user, "password": pwd},
+                    headers={"Content-Type": "application/json",
+                             "Accept": "application/json"},
+                    timeout=15)
+                body = r.json()
+                token = body.get("token") or body.get("access_token") or ""
+                if r.status_code == 200 and token:
+                    result = token
+                else:
+                    error = body.get("error") or body.get("message") or f"HTTP {r.status_code}"
+            except Exception as e:
+                error = str(e)
+            self.root.after(0, lambda: self._on_torr9_token_done(result, error))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_torr9_token_done(self, result, error):
+        self._btn_torr9_token.config(state="normal", text="↺ Récupérer")
+        if error:
+            messagebox.showerror("Torr9", f"Erreur : {error}")
+            return
+        if result:
+            self.vars["torr9_token"].set(result)
+            self._log("Torr9 → Token API récupéré et sauvegardé.", "ok")
+            messagebox.showinfo("Torr9",
+                "Token récupéré ✓\n\nIl sera utilisé à la prochaine connexion.\n"
+                "Vous pouvez le renouveler à tout moment avec ce bouton.")
 
     def _fetch_qb_paths(self):
         """Interroge qBittorrent pour récupérer le save_path par défaut."""
@@ -4693,11 +6171,18 @@ class App:
         self._loading = True
         for k, v in self.vars.items():
             v.set(self.cfg.get(k, ""))
+        # Quota Films
         try:
-            idx = GRADE_MAX.index(int(self.cfg.get("max_movies", 1)))
-            self.grade_film_var.set(get_grades()[idx])
+            idx_f = GRADE_MAX.index(int(self.cfg.get("max_movies", 1)))
+            self.grade_film_var.set(get_grades()[idx_f])
         except (ValueError, IndexError):
             self.grade_film_var.set(get_grades()[0])
+        # Quota Séries (indépendant)
+        try:
+            idx_s = GRADE_MAX.index(int(self.cfg.get("max_series", 1)))
+            self.grade_series_var.set(get_grades()[idx_s])
+        except (ValueError, IndexError):
+            self.grade_series_var.set(get_grades()[0])
         # Mode de connexion
         self._conn_mode = self.cfg.get("conn_mode", "web")
         self._update_conn_btn()
@@ -4718,6 +6203,13 @@ class App:
         self.root.after(40, self._refresh_check_updates_ui)
         # Langue UI
         self.vars["ui_lang"].set(self.cfg.get("ui_lang", "fr"))
+        # Thème UI
+        theme_key = self.cfg.get("ui_theme", "gold")
+        theme_label = THEME_NAMES.get(theme_key, THEME_NAMES["gold"])
+        if "ui_theme" in self.vars:
+            self.vars["ui_theme"].set(theme_label)
+        if theme_key != _current_theme[0]:
+            self.root.after(60, lambda k=theme_key: self._apply_theme(k))
         self._loading = False
 
         # Brancher l'autosave sur chaque variable APRÈS le chargement
@@ -4734,7 +6226,7 @@ class App:
     # WATCHER — Notification retour site
     # ══════════════════════════════════════════════════════════════════════════
     def _set_torrent_client(self, client):
-        """Bascule entre qbittorrent et transmission."""
+        """Bascule entre qbittorrent, transmission, deluge et vuze."""
         self._torrent_client = client
         cfg = self._collect()
         cfg["torrent_client"] = client
@@ -4746,21 +6238,35 @@ class App:
         """Met à jour les boutons et affiche les champs du client actif."""
         if not hasattr(self, "_btn_client_qb"):
             return
-        is_qb = self._torrent_client == "qbittorrent"
-        # Boutons QB/TR : actif = or, inactif = gris
-        self._btn_client_qb.config(
-            fg=C["gold"] if is_qb else C["muted"],
-            highlightthickness=1,
-            highlightbackground=C["gold"] if is_qb else C["muted"])
-        self._btn_client_tr.config(
-            fg=C["muted"] if is_qb else C["gold"],
-            highlightthickness=1,
-            highlightbackground=C["muted"] if is_qb else C["gold"])
-        # Afficher/masquer les champs QB / TR
+        ct = self._torrent_client
+        is_qb = (ct == "qbittorrent")
+        is_tr = (ct == "transmission")
+        is_de = (ct == "deluge")
+        is_vz = (ct == "vuze")
+
+        def _btn_state(btn, active):
+            btn.config(fg=C["gold"] if active else C["muted"],
+                       highlightthickness=1,
+                       highlightbackground=C["gold"] if active else C["muted"])
+
+        _btn_state(self._btn_client_qb, is_qb)
+        _btn_state(self._btn_client_tr, is_tr)
+        if hasattr(self, "_btn_client_de"):
+            _btn_state(self._btn_client_de, is_de)
+        if hasattr(self, "_btn_client_vz"):
+            _btn_state(self._btn_client_vz, is_vz)
+
+        # Afficher/masquer les champs selon le client actif
         for w in self._qb_rows:
             w.grid() if is_qb else w.grid_remove()
         for w in self._tr_rows:
-            w.grid_remove() if is_qb else w.grid()
+            w.grid() if is_tr else w.grid_remove()
+        if hasattr(self, "_de_rows"):
+            for w in self._de_rows:
+                w.grid() if is_de else w.grid_remove()
+        if hasattr(self, "_vz_rows"):
+            for w in self._vz_rows:
+                w.grid() if is_vz else w.grid_remove()
 
     def _set_active_tracker(self, tracker):
         """Bascule le tracker actif entre lacale et torr9."""
@@ -4826,6 +6332,73 @@ class App:
         else:
             self._health_var.set(f"Santé La Cale : {bille}")
 
+    def _self_update(self):
+        """
+        Telecharge la derniere version depuis GitHub et remplace le fichier .py courant.
+        Ecriture atomique via un .tmp pour eviter la corruption.
+        """
+        if not _REQUESTS_OK:
+            self._log("  Mise a jour : impossible (requests non disponible).", "err")
+            return
+        if hasattr(self, "_btn_self_update"):
+            self._btn_self_update.config(state="disabled", fg=C["muted"])
+
+        def _do_update():
+            self._log("─" * 60, "muted")
+            self._log("  Mise a jour — Connexion a GitHub...", "gold")
+            try:
+                r = requests.get(
+                    _UPDATE_URL, timeout=20,
+                    headers={"User-Agent": "BLACK-FLAG-updater/" + APP_VERSION})
+                if r.status_code != 200:
+                    self._log(
+                        f"  Echec de connexion — HTTP {r.status_code}.", "err")
+                    return
+                new_src = r.text
+                if "APP_VERSION" not in new_src or "class App" not in new_src:
+                    self._log(
+                        "  Fichier distant invalide — mise a jour annulee.", "err")
+                    return
+                remote_ver = ""
+                for line in new_src.splitlines()[:200]:
+                    s = line.strip()
+                    if s.startswith("APP_VERSION") and "=" in s:
+                        remote_ver = s.split("=")[1].strip().strip("\"'")
+                        break
+                self._log(
+                    f"  Fichier distant valide — version {remote_ver or '?'}.", "gold")
+                self._log("  Remplacement du fichier en cours...", "gold")
+                if getattr(sys, "frozen", False):
+                    target = Path(sys.executable).parent / "BLACK.FLAG version exe.py"
+                else:
+                    target = Path(__file__).resolve()
+                tmp = target.with_suffix(".tmp")
+                tmp.write_text(new_src, encoding="utf-8")
+                tmp.replace(target)
+                self._log(f"  Fichier mis a jour : {target.name}", "ok")
+                self._log("  Relancez BLACK FLAG !", "ok")
+            except requests.exceptions.ConnectionError:
+                self._log(
+                    "  Echec — impossible de joindre GitHub (reseau KO).", "err")
+            except requests.exceptions.Timeout:
+                self._log(
+                    "  Echec — delai de connexion depasse (timeout).", "err")
+            except PermissionError:
+                self._log(
+                    "  Echec — permission refusee lors de l'ecriture du fichier.", "err")
+                self._log(
+                    "  Essayez de lancer BLACK FLAG en administrateur.", "err")
+            except Exception as e:
+                self._log(f"  Echec de la mise a jour : {e}", "err")
+            finally:
+                self.root.after(0, self._restore_update_btn)
+
+        threading.Thread(target=_do_update, daemon=True).start()
+
+    def _restore_update_btn(self):
+        if hasattr(self, "_btn_self_update"):
+            self._btn_self_update.config(state="normal", fg=C["gold"])
+
     def _toggle_check_updates(self):
         self._check_updates_enabled = not self._check_updates_enabled
         cfg = self._collect(); cfg["check_updates"] = self._check_updates_enabled
@@ -4876,6 +6449,26 @@ class App:
                 self.root.after(0, self._show_update_badge, changelog)
         threading.Thread(target=_check, daemon=True).start()
 
+    def _hide_update_install_btn(self):
+        """Cache le bouton d'installation GitHub et son séparateur."""
+        for w in ("_upd_sep", "_upd_frame"):
+            widget = getattr(self, w, None)
+            if widget:
+                try:
+                    widget.grid_remove()
+                except Exception:
+                    pass
+
+    def _show_update_install_btn(self):
+        """Affiche le bouton d'installation GitHub et son séparateur."""
+        for w in ("_upd_sep", "_upd_frame"):
+            widget = getattr(self, w, None)
+            if widget:
+                try:
+                    widget.grid()
+                except Exception:
+                    pass
+
     def _show_update_badge(self, changelog=""):
         """Affiche l'étiquette verte 'Mise à jour disponible' avec tooltip."""
         if not hasattr(self, "_lbl_update"):
@@ -4885,6 +6478,8 @@ class App:
             return
         self._lbl_update.config(text=f"  ↑ {t('lbl_update_available')}")
         self._lbl_update.pack(side="left", padx=(10, 0))
+        # Afficher aussi le bouton d'installation dans les paramètres
+        self.root.after(0, self._show_update_install_btn)
         # Tooltip au survol
         if changelog:
             self._add_tooltip(self._lbl_update, changelog)
@@ -4940,6 +6535,122 @@ class App:
             else:
                 btn.config(text=t(off_key), fg=C["muted"],
                            highlightthickness=1, highlightbackground=C["muted"])
+
+    def _toggle_encrypt_cfg(self):
+        """Active ou désactive le chiffrement de la config."""
+        if not _CRYPTO_OK:
+            messagebox.showwarning(
+                "Chiffrement indisponible",
+                "La bibliotheque 'cryptography' n'est pas installee.\n"
+                "Redemarrez l'application pour qu'elle s'installe automatiquement.")
+            return
+        if not self._encrypt_cfg_enabled:
+            # Activation : demander le mot de passe maître
+            pw = self._ask_master_password(confirm=True)
+            if pw is None:
+                return   # annulé
+            _SESSION_MASTER_PW[0] = pw
+            self._encrypt_cfg_enabled = True
+        else:
+            # Désactivation : repasser en JSON clair
+            self._encrypt_cfg_enabled = False
+            _SESSION_MASTER_PW[0] = None
+        cfg = self._collect()
+        cfg["encrypt_cfg"] = self._encrypt_cfg_enabled
+        save_cfg(cfg); self.cfg = cfg
+        self._refresh_encrypt_cfg_ui()
+
+    def _refresh_encrypt_cfg_ui(self):
+        if not hasattr(self, "_btn_encrypt_cfg"):
+            return
+        enabled = self._encrypt_cfg_enabled
+        if enabled:
+            self._btn_encrypt_cfg.config(
+                text="ACTIF", fg=C["green"],
+                highlightthickness=1, highlightbackground=C["green"])
+        else:
+            self._btn_encrypt_cfg.config(
+                text="INACTIF", fg=C["muted"],
+                highlightthickness=1, highlightbackground=C["muted"])
+
+    @staticmethod
+    def _ask_master_password(confirm=False, title="Mot de passe maître"):
+        """
+        Popup tkinter demandant le mot de passe maître.
+        Si confirm=True, demande deux fois (création).
+        Retourne le mot de passe str, ou None si annulé/vide.
+        """
+        import tkinter as _tk
+        from tkinter import simpledialog as _sd
+
+        class _PwDialog(_tk.Toplevel):
+            def __init__(self, parent, confirm):
+                super().__init__(parent)
+                self.title(title)
+                self.resizable(False, False)
+                self.configure(bg=C["bg"])
+                self.grab_set()
+                self.result = None
+
+                _tk.Label(self, text="Mot de passe maître :", font=FM,
+                          bg=C["bg"], fg=C["text"]).grid(
+                    row=0, column=0, padx=12, pady=(14, 4), sticky="w")
+                self._e1 = _tk.Entry(self, show="*", font=FM,
+                                     bg=C["ibg"], fg=C["ifg"],
+                                     insertbackground=C["gold"],
+                                     relief="flat", width=28)
+                self._e1.grid(row=0, column=1, padx=(4, 12), pady=(14, 4))
+                self._e1.focus_set()
+
+                if confirm:
+                    _tk.Label(self, text="Confirmer :", font=FM,
+                              bg=C["bg"], fg=C["text"]).grid(
+                        row=1, column=0, padx=12, pady=4, sticky="w")
+                    self._e2 = _tk.Entry(self, show="*", font=FM,
+                                         bg=C["ibg"], fg=C["ifg"],
+                                         insertbackground=C["gold"],
+                                         relief="flat", width=28)
+                    self._e2.grid(row=1, column=1, padx=(4, 12), pady=4)
+                else:
+                    self._e2 = None
+
+                self._lbl_err = _tk.Label(self, text="", font=FM8,
+                                          bg=C["bg"], fg=C["red"])
+                self._lbl_err.grid(row=2, column=0, columnspan=2, pady=(0, 4))
+
+                btn_f = _tk.Frame(self, bg=C["bg"])
+                btn_f.grid(row=3, column=0, columnspan=2, pady=(4, 12))
+                _tk.Button(btn_f, text="OK", font=FB,
+                           bg=C["panel"], fg=C["gold"], relief="flat",
+                           padx=16, command=self._ok).pack(side="left", padx=6)
+                _tk.Button(btn_f, text="Annuler", font=FL,
+                           bg=C["panel"], fg=C["muted"], relief="flat",
+                           padx=10, command=self.destroy).pack(side="left", padx=6)
+
+                self.bind("<Return>", lambda e: self._ok())
+                self.bind("<Escape>", lambda e: self.destroy())
+                self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+            def _ok(self):
+                pw = self._e1.get()
+                if not pw:
+                    self._lbl_err.config(text="Le mot de passe ne peut pas être vide.")
+                    return
+                if self._e2 is not None and pw != self._e2.get():
+                    self._lbl_err.config(text="Les mots de passe ne correspondent pas.")
+                    return
+                self.result = pw
+                self.destroy()
+
+        # Trouver la fenêtre root active
+        try:
+            root = _tk._default_root
+        except Exception:
+            root = None
+        dlg = _PwDialog(root, confirm)
+        if root:
+            root.wait_window(dlg)
+        return dlg.result
 
     def _toggle_notify(self):
         """Active ou désactive la notification de retour du site."""
@@ -5157,90 +6868,29 @@ class App:
 
     def _update_conn_btn(self):
         """Met à jour le visuel du bouton toggle API/Web."""
-        is_torr9 = getattr(self, "_active_tracker", "lacale") == "torr9"
-        if is_torr9:
-            # Torr9 force le mode Web — bouton grisé, non cliquable visuellement
+        if self._conn_mode == "api":
+            self.b_conn.config(
+                text=f"  {t('conn_api')}  ",
+                fg=C["green"], highlightthickness=1,
+                highlightbackground=C["green"],
+                cursor="hand2")
+        else:
             self.b_conn.config(
                 text=f"  {t('conn_web')}  ",
-                fg=C["muted"], highlightthickness=1,
-                highlightbackground=C["muted"],
-                cursor="arrow")
-            # Attacher le tooltip "pas de switch possible pour Torr9"
-            self._attach_torr9_conn_tooltip()
-        else:
-            if self._conn_mode == "api":
-                self.b_conn.config(
-                    text=f"  {t('conn_api')}  ",
-                    fg=C["green"], highlightthickness=1,
-                    highlightbackground=C["green"],
-                    cursor="hand2")
-            else:
-                self.b_conn.config(
-                    text=f"  {t('conn_web')}  ",
-                    fg=C["gold"], highlightthickness=1,
-                    highlightbackground=C["gold"],
-                    cursor="hand2")
-            self._detach_torr9_conn_tooltip()
+                fg=C["gold"], highlightthickness=1,
+                highlightbackground=C["gold"],
+                cursor="hand2")
         # Afficher/masquer les frames selon le mode
         if hasattr(self, "_frame_api") and hasattr(self, "_frame_web"):
-            if self._conn_mode == "api" and not is_torr9:
+            if self._conn_mode == "api":
                 self._frame_api.grid()
                 self._frame_web.grid_remove()
             else:
                 self._frame_api.grid_remove()
                 self._frame_web.grid()
 
-    def _attach_torr9_conn_tooltip(self):
-        """Attache le tooltip 'Pas de switch de mode possible pour Torr9' au bouton conn."""
-        if not hasattr(self, "_torr9_conn_tip"):
-            self._torr9_conn_tip = {"win": None, "_bound": False}
-        if self._torr9_conn_tip.get("_bound"):
-            return
-
-        def _show(e):
-            x = e.x_root + 16
-            y = e.y_root - 8
-            w = tk.Toplevel(self.root)
-            w.wm_overrideredirect(True)
-            w.wm_geometry(f"+{x}+{y}")
-            w.configure(bg=C["border"])
-            tk.Label(w, text="Pas de switch de mode\npossible pour Torr9",
-                     font=FM8, bg=C["panel"], fg=C["muted"],
-                     relief="flat", bd=0, padx=8, pady=4,
-                     justify="left").pack()
-            self._torr9_conn_tip["win"] = w
-
-        def _move(e):
-            if self._torr9_conn_tip.get("win"):
-                self._torr9_conn_tip["win"].wm_geometry(f"+{e.x_root+16}+{e.y_root-8}")
-
-        def _hide(e):
-            if self._torr9_conn_tip.get("win"):
-                self._torr9_conn_tip["win"].destroy()
-                self._torr9_conn_tip["win"] = None
-
-        self.b_conn.bind("<Enter>",  _show)
-        self.b_conn.bind("<Motion>", _move)
-        self.b_conn.bind("<Leave>",  _hide)
-        self._torr9_conn_tip["_bound"] = True
-
-    def _detach_torr9_conn_tooltip(self):
-        """Supprime le tooltip Torr9 du bouton conn."""
-        if not hasattr(self, "_torr9_conn_tip"):
-            return
-        if self._torr9_conn_tip.get("win"):
-            self._torr9_conn_tip["win"].destroy()
-            self._torr9_conn_tip["win"] = None
-        self.b_conn.unbind("<Enter>")
-        self.b_conn.unbind("<Motion>")
-        self.b_conn.unbind("<Leave>")
-        self._torr9_conn_tip["_bound"] = False
-
     def _toggle_conn_mode(self):
-        """Bascule entre mode API et mode Web.
-        Bloqué si Torr9 est le tracker actif (Web only)."""
-        if getattr(self, "_active_tracker", "lacale") == "torr9":
-            return  # no-op — tooltip géré par _add_conn_torr9_tooltip
+        """Bascule entre mode API et mode Web."""
         self._conn_mode = "api" if self._conn_mode == "web" else "web"
         self._update_conn_btn()
         cfg = self._collect()
@@ -5251,13 +6901,9 @@ class App:
     def _log_active_config(self):
         """Affiche la configuration active dans le log."""
         active = getattr(self, "_active_tracker", "lacale")
-        if active == "torr9":
-            tracker_name = "Torr9"
-            conn = "Web"  # Torr9 = Web only
-        else:
-            conn  = "API" if self._conn_mode == "api" else "Web"
-            tracker_name = "La Cale"
-        client = "TRANSMISSION" if getattr(self, "_torrent_client", "qbittorrent") == "transmission" else "QBITTORRENT"
+        conn   = "API" if self._conn_mode == "api" else "Web"
+        tracker_name = "Torr9" if active == "torr9" else "La Cale"
+        client = getattr(self, "_torrent_client", "qbittorrent").upper()
         self._log(f"  Configuration active : {tracker_name}/{conn}/{client}", "ok")
 
     def _toggle_autosave(self):
@@ -5314,16 +6960,37 @@ class App:
         cfg["autosave_enabled"]= getattr(self, "_autosave_enabled", True)
         cfg["notify_enabled"]  = getattr(self, "_notify_enabled", False)
         cfg["save_logs"]       = getattr(self, "_save_logs_enabled", True)
-        cfg["save_curl"]       = getattr(self, "_save_curl_enabled", True)
+        cfg["save_curl"]       = getattr(self, "_save_curl_enabled", False)
         cfg["check_updates"]   = getattr(self, "_check_updates_enabled", True)
+        cfg["encrypt_cfg"]     = getattr(self, "_encrypt_cfg_enabled", True)
+        # Thème : on stocke la clé interne, pas le label affiché
+        if "ui_theme" in self.vars:
+            label = self.vars["ui_theme"].get().strip()
+            cfg["ui_theme"] = next((k for k,v in THEME_NAMES.items() if v == label), "gold")
+        # Clés Deluge (peuvent ne pas être dans self.vars si UI non initialisée)
+        for k in ("deluge_url", "deluge_pass", "deluge_films_path", "deluge_series_path",
+                  "vuze_url", "vuze_user", "vuze_pass", "vuze_films_path", "vuze_series_path"):
+            if k not in cfg:
+                cfg[k] = DEFAULTS.get(k, "")
         # Champ dev (invisible) — jamais sauvegardé dans la config
         if hasattr(self, "_suffix_var"):
             cfg["_dev_field"] = self._suffix_var.get()
         return cfg
 
     def _browse(self, key):
+        """
+        Ouvre le sélecteur de dossier.
+        Note : le sélecteur tkinter ne peut pas naviguer vers les partages UNC
+        (\\\\NAS\\...). Dans ce cas, saisir le chemin directement dans le champ.
+        Le chemin est normalisé en backslashes Windows avant stockage.
+        """
         d = filedialog.askdirectory(title="…")
-        if d: self.vars[key].set(d)
+        if d:
+            # tkinter retourne des forward slashes — normaliser en backslashes
+            # pour les chemins UNC Windows (\NAS\...) afin que Path().exists() fonctionne
+            import os
+            d_norm = os.path.normpath(d)
+            self.vars[key].set(d_norm)
 
     # ── Log ───────────────────────────────────────────────────────────────────
     def _log(self, msg, tag=None):
@@ -5440,7 +7107,17 @@ class App:
             if not cfg.get("lacale_pass"):  errs.append(t("err_no_pass"))
             if not cfg.get("tracker_url"):  errs.append(t("err_no_tracker"))
 
-        if not cfg.get("qb_url"):       errs.append(t("err_no_qb"))
+        client_type = cfg.get("torrent_client", "qbittorrent")
+        if client_type == "qbittorrent":
+            if not cfg.get("qb_url"):   errs.append(t("err_no_qb"))
+        elif client_type == "transmission":
+            if not cfg.get("tr_url"):   errs.append("URL Transmission requise")
+        elif client_type == "deluge":
+            if not cfg.get("deluge_url"):  errs.append("URL Deluge requise")
+            if not cfg.get("deluge_pass"): errs.append("Mot de passe Deluge requis")
+        elif client_type == "vuze":
+            if not cfg.get("vuze_url"):    errs.append("URL Vuze requise")
+            if not cfg.get("vuze_pass"):   errs.append("Code de pairing Vuze requis")
         if not _REQUESTS_OK:            errs.append(t("err_no_requests"))
         return errs
 
